@@ -68,6 +68,11 @@ namespace {
     extern switch_bool_t filter_json_string(switch_core_session_t *session, const char* message);
 }
 
+// Forward declarations for functions used in cleanup
+extern "C" {
+    void decrement_active_channels();
+}
+
 class AudioStreamer {
 public:
 
@@ -105,7 +110,7 @@ public:
                     cJSON *iterator = headers_json->child;
                     while (iterator) {
                         if (iterator->type == cJSON_String && iterator->valuestring != nullptr && iterator->string != nullptr) {
-                            headers.addHeader(iterator->string, iterator->valuestring);
+                            headers.set(iterator->string, iterator->valuestring);
                             DEBUG_LOG_GLOBAL(DEBUG_LEVEL_VERBOSE, "Added header: %s = %s", iterator->string, iterator->valuestring);
                         }
                         iterator = iterator->next;
