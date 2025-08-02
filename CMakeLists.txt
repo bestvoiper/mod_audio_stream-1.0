@@ -23,26 +23,23 @@ pkg_check_modules(FreeSWITCH REQUIRED IMPORTED_TARGET freeswitch)
 pkg_get_variable(FS_MOD_DIR freeswitch modulesdir)
 message(STATUS "FreeSWITCH modules dir: ${FS_MOD_DIR}")
 
-# Check which WebSocket library is available
+# Force use of libwsc WebSocket library
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/libwsc/CMakeLists.txt")
-    message(STATUS "Using libwsc WebSocket library")
+    message(STATUS "Using libwsc WebSocket library (forced)")
     add_subdirectory(libs/libwsc)
     set(WEBSOCKET_LIB libwsc)
-elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/libs/IXWebSocket/CMakeLists.txt")
-    message(STATUS "Using IXWebSocket library")
-    set(USE_TLS ON CACHE BOOL "Use TLS for secure WebSocket connections" FORCE)
-    set(IXWEBSOCKET_INSTALL OFF CACHE BOOL "Disable ixwebsocket installation" FORCE)
-    add_subdirectory(libs/IXWebSocket)
-    set(WEBSOCKET_LIB ixwebsocket)
+    set(USE_LIBWSC ON)
+    add_definitions(-DUSE_LIBWSC)
 else()
-    message(FATAL_ERROR "No WebSocket library found. Please initialize submodules.")
+    message(FATAL_ERROR "libwsc library not found. Please initialize submodules.")
 endif()
 
 add_library(mod_audio_stream SHARED mod_audio_stream.c mod_audio_stream.h audio_streamer_glue.h audio_streamer_glue.cpp buffer/ringbuffer.c base64.cpp)
 
 set_property(TARGET mod_audio_stream PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-target_include_directories(mod_audio_stream PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libs/IXWebSocket)
+# Include libwsc directory
+target_include_directories(mod_audio_stream PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/libs/libwsc)
 
 target_link_libraries(mod_audio_stream PRIVATE 
     PkgConfig::FreeSWITCH 
