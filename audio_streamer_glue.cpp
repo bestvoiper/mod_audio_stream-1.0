@@ -9,8 +9,15 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "base64.h"
+#include <atomic>
+#include <mutex>
 
 #define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
+
+// Thread-safe global channel management
+static std::atomic<uint32_t> g_active_channels{0};
+static std::mutex g_channel_mutex;
+static std::unordered_set<std::string> g_active_sessions;
 
 class AudioStreamer {
 public:
@@ -19,7 +26,13 @@ public:
                     bool suppressLog, const char* extra_headers, bool no_reconnect,
                     const char* tls_cafile, const char* tls_keyfile, const char* tls_certfile,
                     bool tls_disable_hostname_validation): m_sessionId(uuid), m_notify(callback),
-                    m_suppress_log(suppressLog), m_extra_headers(extra_headers), m_playFile(0){
+                    m_suppress_log(suppressLog), m_extra_headers(extra_headers), m_playFile(0), m_connected(false){
+
+        // Register this session
+        {
+            std::lock_guard<std::mutex> lock(g_channel_mutex);
+            g_active_sessions.insert(uuid);
+        }
 
         WebSocketHeaders hdrs;
         WebSocketTLSOptions tls;
@@ -74,10 +87,13 @@ public:
 
         // Setup a callback to be fired when a message or an event (open, close, error) is received
         client.setMessageCallback([this](const std::string& message) {
-            eventCallback(MESSAGE, message.c_str());
+            if (m_connected) {
+                eventCallback(MESSAGE, message.c_str());
+            }
         });
 
         client.setOpenCallback([this]() {
+            m_connected = true;
             cJSON *root;
             root = cJSON_CreateObject();
             cJSON_AddStringToObject(root, "status", "connected");
@@ -88,6 +104,7 @@ public:
         });
 
         client.setErrorCallback([this](int code, const std::string &msg) {
+            m_connected = false;
             cJSON *root, *message;
             root = cJSON_CreateObject();
             cJSON_AddStringToObject(root, "status", "error");
@@ -97,14 +114,13 @@ public:
             cJSON_AddItemToObject(root, "message", message);
 
             char *json_str = cJSON_PrintUnformatted(root);
-
             eventCallback(CONNECT_ERROR, json_str);
-
             cJSON_Delete(root);
             switch_safe_free(json_str);
         });
 
         client.setCloseCallback([this](int code, const std::string &reason) {
+            m_connected = false;
             cJSON *root, *message;
             root = cJSON_CreateObject();
             cJSON_AddStringToObject(root, "status", "disconnected");
@@ -115,7 +131,6 @@ public:
             char *json_str = cJSON_PrintUnformatted(root);
 
             eventCallback(CONNECTION_DROPPED, json_str);
-
             cJSON_Delete(root);
             switch_safe_free(json_str);
         });
@@ -264,25 +279,44 @@ public:
         return status;
     }
 
-    ~AudioStreamer()= default;
+    ~AudioStreamer() {
+        // Unregister this session
+        {
+            std::lock_guard<std::mutex> lock(g_channel_mutex);
+            g_active_sessions.erase(m_sessionId);
+        }
+        m_connected = false;
+        deleteFiles();
+    }
 
     void disconnect() {
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "disconnecting...\n");
+        m_connected = false;
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "disconnecting session %s...\n", m_sessionId.c_str());
         client.disconnect();
     }
 
     bool isConnected() {
-        return client.isConnected();
+        return m_connected && client.isConnected();
     }
 
     void writeBinary(uint8_t* buffer, size_t len) {
         if(!this->isConnected()) return;
-        client.sendBinary(buffer, len);
+        try {
+            client.sendBinary(buffer, len);
+        } catch (const std::exception& e) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error sending binary data: %s\n", e.what());
+            m_connected = false;
+        }
     }
 
     void writeText(const char* text) {
-        if(!this->isConnected()) return;
-        client.sendMessage(text, strlen(text));
+        if(!this->isConnected() || !text) return;
+        try {
+            client.sendMessage(text, strlen(text));
+        } catch (const std::exception& e) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error sending text: %s\n", e.what());
+            m_connected = false;
+        }
     }
 
     void deleteFiles() {
@@ -301,6 +335,7 @@ private:
     const char* m_extra_headers;
     int m_playFile;
     std::unordered_set<std::string> m_Files;
+    std::atomic<bool> m_connected;
 };
 
 
@@ -363,20 +398,33 @@ namespace {
     }
 
     void destroy_tech_pvt(private_t* tech_pvt) {
+        if (!tech_pvt) return;
+        
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO, "%s destroy_tech_pvt\n", tech_pvt->sessionId);
+        
+        if (tech_pvt->mutex) {
+            switch_mutex_lock(tech_pvt->mutex);
+        }
+        
         if (tech_pvt->resampler) {
             speex_resampler_destroy(tech_pvt->resampler);
             tech_pvt->resampler = nullptr;
         }
-        if (tech_pvt->mutex) {
-            switch_mutex_destroy(tech_pvt->mutex);
-            tech_pvt->mutex = nullptr;
-        }
+        
         if (tech_pvt->pAudioStreamer) {
             auto* as = (AudioStreamer *) tech_pvt->pAudioStreamer;
             delete as;
             tech_pvt->pAudioStreamer = nullptr;
         }
+        
+        if (tech_pvt->mutex) {
+            switch_mutex_unlock(tech_pvt->mutex);
+            switch_mutex_destroy(tech_pvt->mutex);
+            tech_pvt->mutex = nullptr;
+        }
+        
+        // Decrement active channels
+        decrement_active_channels();
     }
 
     void finish(private_t* tech_pvt) {
@@ -393,6 +441,39 @@ namespace {
 }
 
 extern "C" {
+    // Thread-safe channel management functions
+    bool check_channel_limit() {
+        return g_active_channels.load() < MAX_CONCURRENT_CHANNELS;
+    }
+
+    void increment_active_channels() {
+        g_active_channels.fetch_add(1);
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Active channels: %u\n", g_active_channels.load());
+    }
+
+    void decrement_active_channels() {
+        uint32_t prev = g_active_channels.fetch_sub(1);
+        if (prev > 0) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Active channels: %u\n", g_active_channels.load());
+        }
+    }
+
+    uint32_t get_active_channel_count() {
+        return g_active_channels.load();
+    }
+
+    switch_status_t init_audio_stream_module() {
+        g_active_channels.store(0);
+        g_active_sessions.clear();
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    void cleanup_audio_stream_module() {
+        std::lock_guard<std::mutex> lock(g_channel_mutex);
+        g_active_sessions.clear();
+        g_active_channels.store(0);
+    }
+
     int validate_ws_uri(const char* url, char* wsUri) {
         const char* scheme = nullptr;
         const char* hostStart = nullptr;
@@ -513,6 +594,17 @@ extern "C" {
                                         char* metadata,
                                         void **ppUserData)
     {
+        // Check channel limit before proceeding
+        if (!check_channel_limit()) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, 
+                "Maximum concurrent channels (%d) reached. Current: %u\n", 
+                MAX_CONCURRENT_CHANNELS, get_active_channel_count());
+            return SWITCH_STATUS_FALSE;
+        }
+
+        // Increment counter early to reserve slot
+        increment_active_channels();
+
         int deflate, heart_beat;
         bool suppressLog = false;
         const char* buffer_size;
@@ -572,6 +664,7 @@ extern "C" {
 
         if (!tech_pvt) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "error allocating memory!\n");
+            decrement_active_channels();
             return SWITCH_STATUS_FALSE;
         }
         if (SWITCH_STATUS_SUCCESS != stream_data_init(tech_pvt, session, wsUri, samples_per_second, sampling, channels, metadata, responseHandler, deflate, heart_beat,
@@ -587,8 +680,11 @@ extern "C" {
 
     switch_bool_t stream_frame(switch_media_bug_t *bug) {
         auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
-        if (!tech_pvt || tech_pvt->audio_paused) return SWITCH_TRUE;
+        if (!tech_pvt || tech_pvt->audio_paused || tech_pvt->close_requested) {
+            return SWITCH_TRUE;
+        }
 
+        // Use trylock to prevent blocking
         if (switch_mutex_trylock(tech_pvt->mutex) != SWITCH_STATUS_SUCCESS) {
             return SWITCH_TRUE;
         }
@@ -600,6 +696,7 @@ extern "C" {
             return SWITCH_TRUE;
         }
 
+        // ...existing frame processing code with better error handling...
         auto flush_sbuffer = [&]() {
             switch_size_t inuse = switch_buffer_inuse(tech_pvt->sbuffer);
             if (inuse > 0) {
@@ -615,7 +712,7 @@ extern "C" {
         frame.data = data_buf;
         frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
 
-        while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS) {
+        while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS && !tech_pvt->close_requested) {
             if (!tech_pvt->resampler) {
                 if (tech_pvt->rtp_packets == 1) {
                     pAudioStreamer->writeBinary((uint8_t *)frame.data, frame.datalen);
@@ -686,35 +783,59 @@ extern "C" {
     switch_status_t stream_session_cleanup(switch_core_session_t *session, char* text, int channelIsClosing) {
         switch_channel_t *channel = switch_core_session_get_channel(session);
         auto *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
-        if(bug)
-        {
-            auto* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
-            char sessionId[MAX_SESSION_ID];
-            strcpy(sessionId, tech_pvt->sessionId);
-
-            switch_mutex_lock(tech_pvt->mutex);
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_session_cleanup\n", sessionId);
-
-            switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
-            if (!channelIsClosing) {
-                switch_core_media_bug_remove(session, &bug);
-            }
-
-            auto* audioStreamer = (AudioStreamer *) tech_pvt->pAudioStreamer;
-            if(audioStreamer) {
-                audioStreamer->deleteFiles();
-                if (text) audioStreamer->writeText(text);
-                finish(tech_pvt);
-            }
-
-            destroy_tech_pvt(tech_pvt);
-
-            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%s) stream_session_cleanup: connection closed\n", sessionId);
-            return SWITCH_STATUS_SUCCESS;
+        
+        if (!bug) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "stream_session_cleanup: no bug - websocket connection already closed\n");
+            return SWITCH_STATUS_FALSE;
         }
 
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "stream_session_cleanup: no bug - websocket connection already closed\n");
-        return SWITCH_STATUS_FALSE;
+        auto* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "stream_session_cleanup: no tech_pvt\n");
+            return SWITCH_STATUS_FALSE;
+        }
+
+        char sessionId[MAX_SESSION_ID];
+        strncpy(sessionId, tech_pvt->sessionId, MAX_SESSION_ID - 1);
+        sessionId[MAX_SESSION_ID - 1] = '\0';
+
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_session_cleanup\n", sessionId);
+
+        // Prevent multiple cleanup calls
+        if (tech_pvt->close_requested) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) cleanup already in progress\n", sessionId);
+            return SWITCH_STATUS_SUCCESS;
+        }
+        
+        tech_pvt->close_requested = 1;
+
+        if (tech_pvt->mutex) {
+            switch_mutex_lock(tech_pvt->mutex);
+        }
+
+        switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
+        
+        if (!channelIsClosing) {
+            switch_core_media_bug_remove(session, &bug);
+        }
+
+        auto* audioStreamer = (AudioStreamer *) tech_pvt->pAudioStreamer;
+        if (audioStreamer) {
+            audioStreamer->deleteFiles();
+            if (text) {
+                audioStreamer->writeText(text);
+            }
+            finish(tech_pvt);
+        }
+
+        if (tech_pvt->mutex) {
+            switch_mutex_unlock(tech_pvt->mutex);
+        }
+
+        destroy_tech_pvt(tech_pvt);
+
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%s) stream_session_cleanup: connection closed\n", sessionId);
+        return SWITCH_STATUS_SUCCESS;
     }
 }
 

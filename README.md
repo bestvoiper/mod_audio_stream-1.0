@@ -2,32 +2,15 @@
 
 A FreeSWITCH module that streams L16 audio from a channel to a websocket endpoint. If websocket sends back responses (eg. JSON) it can be effectively used with ASR engines such as IBM Watson etc., or any other purpose you find applicable.
 
-### Update (22/2/2025)
+#### About
 
-#### :rocket: **Introducing Bi-Directional Streaming with automatic playback**
-
-A new version `mod-audio-stream v1.0.3` has been published, featuring **raw binary stream** from the websocket.
-It can be downloaded from the **Releases** section (pre-release) and comes as a pre-built Debian 12 package.
-
-- Playback feature allows continuous forward streaming while the playback runs independently.
-- It is a **full-duplex streamer** between the caller and the websocket.
-- It supports **base64 encoded audio** as well as the **raw binary stream** from the websocket.
-- Playback can be **tracked, paused, or resumed** dynamically.
-
-:small_blue_diamond: This release is a commercial product that is available for **free use**, including commercial use, with a limitation of **10 concurrent streaming channels**. For users requiring more than 10 channels, or access to the source code, please [contact us](mailto:amsoftswitch@gmail.com)
- for further information and licensing options.
-
-### About
-
-- The purpose of `mod_audio_stream` was to provide a simple, low-dependency yet effective module for streaming audio and receiving responses from a websocket server.
-- Introduced [libwsc](https://github.com/amigniter/libwsc), our in-house, **RFC-6455 compliant** websocket client developed specifically for `mod_audio_stream`.
-  - Replaces [ixwebsocket](https://machinezone.github.io/IXWebSocket/), which served us well for the past few years. `libwsc` is libevent-based, extremely lightweight, and optimized for low-latency audio streaming.
-- This module was inspired by mod_audio_fork.
+- The purpose of `mod_audio_stream` was to make a simple, less dependent but yet effective module to stream audio and receive responses from websocket server. It uses [ixwebsocket](https://machinezone.github.io/IXWebSocket/), c++ library for websocket protocol which is compiled as a static library.
+- This module was inspired by [mod_audio_fork](https://github.com/drachtio/drachtio-freeswitch-modules/tree/main/modules/mod_audio_fork).
 
 ## Installation
 
 ### Dependencies
-It requires `libfreeswitch-dev`, `libssl-dev`, `zlib1g-dev`, `libevent-dev` and `libspeexdsp-dev` on Debian/Ubuntu which are regular packages for Freeswitch installation.
+It requires `libfreeswitch-dev`, `libssl-dev`, `zlib1g-dev` and `libspeexdsp-dev` on Debian/Ubuntu which are regular packages for Freeswitch installation.
 ### Building
 After cloning please execute: **git submodule init** and **git submodule update** to initialize the submodule.
 #### Custom path
@@ -35,21 +18,13 @@ If you built FreeSWITCH from source, eq. install dir is /usr/local/freeswitch, a
 ```
 export PKG_CONFIG_PATH=/usr/local/freeswitch/lib/pkgconfig
 ```
-To build the module, from the cloned repository:
+To build the module, from the cloned repository directory:
 ```
 mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make
 sudo make install
 ```
-**TLS** is `OFF` by default. To build with TLS support add `-DUSE_TLS=ON` to cmake line.
-
-#### DEB Package
-To build DEB package after making the module:
-```
-cpack -G DEB
-```
-Debian package will be placed in root directory `_packages` folder.
 
 ## Scripted Build & Installation
 
@@ -64,18 +39,14 @@ sudo apt-get -y install git \
 ### Channel variables
 The following channel variables can be used to fine tune websocket connection and also configure mod_audio_stream logging:
 
-| Variable                               | Description                                             | Default |
-| -------------------------------------- | ------------------------------------------------------- | ------- |
-| STREAM_MESSAGE_DEFLATE                 | true or 1, disables per message deflate                 | off     |
-| STREAM_HEART_BEAT                      | number of seconds, interval to send the heart beat      | off     |
-| STREAM_SUPPRESS_LOG                    | true or 1, suppresses printing to log                   | off     |
-| STREAM_BUFFER_SIZE                     | buffer duration in milliseconds, divisible by 20        | 20      |
-| STREAM_EXTRA_HEADERS                   | JSON object for additional headers in string format     | none    |
-| ~~STREAM_NO_RECONNECT~~                    | true or 1, disables automatic websocket reconnection    | off     |
-| STREAM_TLS_CA_FILE                     | CA cert or bundle, or the special values SYSTEM or NONE | SYSTEM  |
-| STREAM_TLS_KEY_FILE                    | optional client key for WSS connections                 | none    |
-| STREAM_TLS_CERT_FILE                   | optional client cert for WSS connections                | none    |
-| STREAM_TLS_DISABLE_HOSTNAME_VALIDATION | true or 1 disable hostname check in WSS connections     | false   |
+| Variable               | Description                                         | Default |
+|------------------------|-----------------------------------------------------|---------|
+| STREAM_MESSAGE_DEFLATE | true or 1, disables per message deflate             | off     |
+| STREAM_HEART_BEAT      | number of seconds, interval to send the heart beat  | off     |
+| STREAM_SUPPRESS_LOG    | true or 1, suppresses printing to log               | off     |
+| STREAM_BUFFER_SIZE     | buffer duration in milliseconds, divisible by 20    | 20      |
+| STREAM_EXTRA_HEADERS   | JSON object for additional headers in string format | none    |
+| STREAM_NO_RECONNECT    | true or 1, disables automatic websocket reconnection| off     |
 
 - Per message deflate compression option is enabled by default. It can lead to a very nice bandwidth savings. To disable it set the channel var to `true|1`.
 - Heart beat, sent every xx seconds when there is no traffic to make sure that load balancers do not kill an idle connection.
@@ -89,15 +60,7 @@ you would set this variable to 100. If ommited, default packet size of 20ms will
       "Header2": "Value2",
       "Header3": "Value3"
   }
-- ~~Websocket automatic reconnection is on by default. To disable it set this channel variable to true or 1.~~
-  - libwsc does not support automatic reconnection.
-- TLS (for WSS) options can be fine tuned with the `STREAM_TLS_*` channel variables:
-  - `STREAM_TLS_CA_FILE` the ca certificate (or certificate bundle) file. By default is `SYSTEM` which means use the system defaults.
-Can be `NONE` which result in no peer verification.
-  - `STREAM_TLS_CERT_FILE` optional client tls certificate file sent to the server.
-  - `STREAM_TLS_KEY_FILE` optional client tls key file for the given certificate.
-  - `STREAM_TLS_DISABLE_HOSTNAME_VALIDATION` if `true`, disables the check of the hostname against the peer server certificate.
-Defaults to `false`, which enforces hostname match with the peer certificate.
+- Websocket automatic reconnection is on by default. To disable it set this channel variable to true or 1.
 
 ## API
 
@@ -190,28 +153,14 @@ There is an error with the connection. Multiple fields will be available on the 
 {
 	"status": "error",
 	"message": {
-		"code": 1,
-		"error": "String explaining the error"
+		"retries": 1,
+		"error": "Expecting status 101 (Switching Protocol), got 403 status connecting to wss://localhost, HTTP Status line: HTTP/1.1 403 Forbidden\r\n",
+		"wait_time": 100,
+		"http_status": 403
 	}
 }
 ```
-- code: `<int>`
-- error: `<string>`
-
-#### Possible `code` values
-
-| Code | Enum Name             | Meaning                                              |
-|:----:|:----------------------|:-----------------------------------------------------|
-| 1    | `IO`                  | I/O error when reading/writing sockets               |
-| 2    | `INVALID_HEADER`      | Server sent a malformed WebSocket header             |
-| 3    | `SERVER_MASKED`       | Server frames were masked (not allowed by spec)      |
-| 4    | `NOT_SUPPORTED`       | Requested feature (e.g. extension) not supported     |
-| 5    | `PING_TIMEOUT`        | No PONG received within timeout                      |
-| 6    | `CONNECT_FAILED`      | TCP connection or DNS lookup failed                  |
-| 7    | `TLS_INIT_FAILED`     | Couldn't initialize SSL/TLS context                  |
-| 8    | `SSL_HANDSHAKE_FAILED`| SSL/TLS handshake with server failed                 |
-| 9    | `SSL_ERROR`           | Generic OpenSSL error (certificate, cipher, etc.)    |
-
+- retries: `<int>`, error: `<string>`, wait_time: `<int>`, http_status: `<int>`
 
 ### play
 **Name**: mod_audio_stream::play

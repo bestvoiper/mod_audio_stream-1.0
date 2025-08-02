@@ -2,7 +2,18 @@
 #define AUDIO_STREAMER_GLUE_H
 #include "mod_audio_stream.h"
 
+// Channel management with thread safety
+#define MAX_CONCURRENT_CHANNELS 100  // Configurable limit
 
+// Thread-safe channel operations
+bool check_channel_limit();
+void increment_active_channels();
+void decrement_active_channels();
+uint32_t get_active_channel_count();
+
+// Initialize/cleanup global resources
+switch_status_t init_audio_stream_module();
+void cleanup_audio_stream_module();
 
 int validate_ws_uri(const char* url, char *wsUri);
 switch_status_t is_valid_utf8(const char *str);

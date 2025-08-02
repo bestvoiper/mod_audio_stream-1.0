@@ -66,8 +66,17 @@ static switch_status_t start_capture(switch_core_session_t *session,
     void *pUserData = NULL;
     int channels = (flags & SMBF_STEREO) ? 2 : 1;
 
+    // Check if bug already exists
     if (switch_channel_get_private(channel, MY_BUG_NAME)) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: bug already attached!\n");
+        return SWITCH_STATUS_FALSE;
+    }
+
+    // Check channel limit before proceeding
+    if (!check_channel_limit()) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, 
+            "mod_audio_stream: Maximum concurrent channels (%d) reached. Current: %u\n", 
+            MAX_CONCURRENT_CHANNELS, get_active_channel_count());
         return SWITCH_STATUS_FALSE;
     }
 
@@ -77,6 +86,10 @@ static switch_status_t start_capture(switch_core_session_t *session,
     }
 
     read_codec = switch_core_session_get_read_codec(session);
+    if (!read_codec) {
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: no read codec available\n");
+        return SWITCH_STATUS_FALSE;
+    }
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "calling stream_session_init.\n");
     if (SWITCH_STATUS_FALSE == stream_session_init(session, responseHandler, read_codec->implementation->actual_samples_per_second,
@@ -84,10 +97,14 @@ static switch_status_t start_capture(switch_core_session_t *session,
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing mod_audio_stream session.\n");
         return SWITCH_STATUS_FALSE;
     }
+    
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "adding bug.\n");
     if ((status = switch_core_media_bug_add(session, MY_BUG_NAME, NULL, capture_callback, pUserData, 0, flags, &bug)) != SWITCH_STATUS_SUCCESS) {
+        // Cleanup on failure
+        stream_session_cleanup(session, NULL, 0);
         return status;
     }
+    
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "setting bug private data.\n");
     switch_channel_set_private(channel, MY_BUG_NAME, bug);
 
@@ -251,6 +268,12 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_stream_load)
 
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_stream API loading..\n");
 
+    // Initialize global resources
+    if (init_audio_stream_module() != SWITCH_STATUS_SUCCESS) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Failed to initialize audio stream module\n");
+        return SWITCH_STATUS_TERM;
+    }
+
     /* connect my internal structure to the blank pointer passed to me */
     *module_interface = switch_loadable_module_create_module_interface(pool, modname);
 
@@ -260,8 +283,10 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_stream_load)
         switch_event_reserve_subclass(EVENT_ERROR) != SWITCH_STATUS_SUCCESS ||
         switch_event_reserve_subclass(EVENT_DISCONNECT) != SWITCH_STATUS_SUCCESS) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register an event subclass for mod_audio_stream API.\n");
+        cleanup_audio_stream_module();
         return SWITCH_STATUS_TERM;
     }
+    
     SWITCH_ADD_API(api_interface, "uuid_audio_stream", "audio_stream API", stream_function, STREAM_API_SYNTAX);
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid start wss-url metadata");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid start wss-url");
@@ -276,15 +301,18 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_stream_load)
     return SWITCH_STATUS_SUCCESS;
 }
 
-/*
-  Called when the system shuts down
-  Macro expands to: switch_status_t mod_audio_stream_shutdown() */
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_audio_stream_shutdown)
 {
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_stream shutting down...\n");
+    
+    // Cleanup global resources
+    cleanup_audio_stream_module();
+    
     switch_event_free_subclass(EVENT_JSON);
     switch_event_free_subclass(EVENT_CONNECT);
     switch_event_free_subclass(EVENT_DISCONNECT);
     switch_event_free_subclass(EVENT_ERROR);
 
+    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_stream shutdown complete\n");
     return SWITCH_STATUS_SUCCESS;
 }
