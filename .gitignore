@@ -3,3 +3,31 @@ cmake-build-debug/
 .vscode/
 build/
 _packages
+
+# Compilation artifacts
+*.o
+*.so
+*.a
+*.la
+*.lo
+.libs/
+.deps/
+
+# Debug files
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Backup files
+*~
+*.bak
+*.swp
+*.swo
+
+# Log files
+*.log
