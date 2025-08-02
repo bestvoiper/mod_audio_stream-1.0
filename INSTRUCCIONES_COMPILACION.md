@@ -30,8 +30,13 @@ export PKG_CONFIG_PATH=/usr/local/freeswitch/lib/pkgconfig:$PKG_CONFIG_PATH
 cd /usr/src
 git clone https://github.com/amigniter/mod_audio_stream.git
 cd mod_audio_stream
-git submodule init
-git submodule update
+
+# Inicializar submodules - método recomendado
+git submodule update --init --recursive
+
+# Si el comando anterior falla, usar método alternativo:
+# git submodule init
+# git submodule update
 ```
 
 ### 4. Compilar
@@ -65,6 +70,23 @@ fs_cli -x "module_exists mod_audio_stream"
 ```
 
 ## Troubleshooting
+
+### Error: "No url found for submodule"
+**Problema**: Configuración de submodules incompleta.
+**Solución**: 
+```bash
+# Limpiar submodules existentes
+git submodule deinit --all
+rm -rf .git/modules/*
+
+# Volver a inicializar
+git submodule update --init --recursive
+
+# Si persiste el error, clonar manualmente:
+git clone https://github.com/machinezone/IXWebSocket libs/IXWebSocket
+# O alternativamente:
+git clone https://github.com/amigniter/libwsc libs/libwsc
+```
 
 ### Error: "libfreeswitch-dev not found"
 **Solución**: Normal si FreeSWITCH fue compilado desde fuente. El script continuará automáticamente.
