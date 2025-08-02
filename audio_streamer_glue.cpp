@@ -31,7 +31,7 @@
 #define DEBUG_LEVEL_VERBOSE  5
 
 // Channel management constants
-#define MAX_CONCURRENT_CHANNELS 50  // Increased limit to handle more calls
+#define MAX_CONCURRENT_CHANNELS 2000 // Increased limit to handle more calls
 
 // Thread-safe global channel management
 static std::atomic<uint32_t> g_active_channels{0};
