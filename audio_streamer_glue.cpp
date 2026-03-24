@@ -1205,4 +1205,71 @@ extern "C" {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%s) stream_session_cleanup: connection closed\n", sessionId);
         return SWITCH_STATUS_SUCCESS;
     }
+
+    // Audio injection functions
+    switch_status_t enable_audio_injection(switch_core_session_t *session, int enable) {
+        if (!session) {
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        switch_channel_t *channel = switch_core_session_get_channel(session);
+        if (!channel) {
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        auto *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
+        if (!bug) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, 
+                "enable_audio_injection: No active stream bug found\n");
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        auto *tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt) {
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        tech_pvt->inject_audio_enabled = enable;
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, 
+            "(%s) Audio injection %s\n", tech_pvt->sessionId, enable ? "enabled" : "disabled");
+        
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    switch_status_t inject_audio_data(switch_core_session_t *session, const uint8_t* audio_data, 
+                                      size_t data_len, int sample_rate, int channels) {
+        if (!session || !audio_data || data_len == 0) {
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        switch_channel_t *channel = switch_core_session_get_channel(session);
+        if (!channel) {
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        auto *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
+        if (!bug) {
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        auto *tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt || !tech_pvt->inject_audio_enabled) {
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        // TODO: Implement actual audio injection logic
+        DEBUG_LOG(DEBUG_LEVEL_DEBUG, session, "inject_audio_data: Received %zu bytes at %d Hz", 
+                 data_len, sample_rate);
+        
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    switch_status_t process_injected_audio(switch_core_session_t *session, switch_frame_t *frame) {
+        if (!session || !frame) {
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        // TODO: Implement actual audio processing logic
+        return SWITCH_STATUS_SUCCESS;
+    }
 }
