@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Injection Demo - mod_audio_stream</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        .section {
+            margin-bottom: 30px;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            background-color: #fafafa;
+        }
+        
+        .section h2 {
+            margin-top: 0;
+            color: #555;
+        }
+        
+        .control-group {
+            margin-bottom: 15px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        
+        input, select, button, textarea {
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        input[type="text"], input[type="url"], select, textarea {
+            width: 100%;
+            box-sizing: border-box;
+        }
+        
+        button {
+            background-color: #007bff;
+            color: white;
+            border: none;
+            cursor: pointer;
+            margin-right: 10px;
+            margin-bottom: 10px;
+        }
+        
+        button:hover {
+            background-color: #0056b3;
+        }
+        
+        button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
+        }
+        
+        .status {
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+        }
+        
+        .status.connected {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .status.disconnected {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .log {
+            background-color: #f8f9fa;
+            border: 1px solid #e9ecef;
+            padding: 10px;
+            height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+        
+        .tone-controls {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 10px;
+        }
+        
+        .recording-controls {
+            text-align: center;
+        }
+        
+        .recording {
+            background-color: #dc3545;
+        }
+        
+        .file-drop {
+            border: 2px dashed #ddd;
+            padding: 20px;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.3s;
+        }
+        
+        .file-drop:hover, .file-drop.dragover {
+            border-color: #007bff;
+            background-color: #f8f9ff;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎵 Audio Injection Demo</h1>
+        
+        <!-- Connection Section -->
+        <div class="section">
+            <h2>WebSocket Connection</h2>
+            <div class="control-group">
+                <label for="websocketUrl">WebSocket URL:</label>
+                <input type="url" id="websocketUrl" value="wss://localhost:8080/audio" placeholder="wss://your-server.com/audio">
+            </div>
+            <button id="connectBtn">Connect</button>
+            <button id="disconnectBtn" disabled>Disconnect</button>
+            <div id="connectionStatus" class="status disconnected">Disconnected</div>
+        </div>
+
+        <!-- File Upload Section -->
+        <div class="section">
+            <h2>📁 File Upload</h2>
+            <div class="file-drop" id="fileDrop">
+                <p>Drag and drop audio files here or click to select</p>
+                <input type="file" id="audioFileInput" accept=".wav,.mp3,.ogg" style="display: none;">
+            </div>
+            <div class="control-group">
+                <label for="fileFormat">Format Override:</label>
+                <select id="fileFormat">
+                    <option value="auto">Auto-detect</option>
+                    <option value="wav">WAV</option>
+                    <option value="mp3">MP3</option>
+                    <option value="ogg">OGG</option>
+                    <option value="raw">Raw PCM</option>
+                </select>
+            </div>
+        </div>
+
+        <!-- Tone Generator Section -->
+        <div class="section">
+            <h2>🎵 Tone Generator</h2>
+            <div class="tone-controls">
+                <div class="control-group">
+                    <label for="frequency">Frequency (Hz):</label>
+                    <input type="number" id="frequency" value="440" min="20" max="20000">
+                </div>
+                <div class="control-group">
+                    <label for="duration">Duration (seconds):</label>
+                    <input type="number" id="duration" value="2" min="0.1" max="10" step="0.1">
+                </div>
+                <div class="control-group">
+                    <label for="volume">Volume:</label>
+                    <input type="range" id="volume" value="50" min="0" max="100">
+                </div>
+            </div>
+            <button id="generateTone">Generate Tone</button>
+            <button id="generateDTMF1">DTMF: 1</button>
+            <button id="generateDTMF0">DTMF: 0</button>
+            <button id="generateBeep">Beep</button>
+        </div>
+
+        <!-- Microphone Recording Section -->
+        <div class="section">
+            <h2>🎤 Microphone Recording</h2>
+            <div class="recording-controls">
+                <div class="control-group">
+                    <label for="recordDuration">Recording Duration (seconds):</label>
+                    <input type="number" id="recordDuration" value="5" min="1" max="30">
+                </div>
+                <button id="startRecording">Start Recording</button>
+                <button id="stopRecording" disabled>Stop Recording</button>
+                <div id="recordingStatus"></div>
+            </div>
+        </div>
+
+        <!-- URL Audio Section -->
+        <div class="section">
+            <h2>🌐 Audio from URL</h2>
+            <div class="control-group">
+                <label for="audioUrl">Audio URL:</label>
+                <input type="url" id="audioUrl" placeholder="https://example.com/audio.wav">
+            </div>
+            <button id="playFromUrl">Inject from URL</button>
+        </div>
+
+        <!-- Text-to-Speech Section -->
+        <div class="section">
+            <h2>🗣️ Text-to-Speech</h2>
+            <div class="control-group">
+                <label for="ttsText">Text to speak:</label>
+                <textarea id="ttsText" rows="3" placeholder="Enter text to convert to speech...">Hello, this is a test of the audio injection system.</textarea>
+            </div>
+            <div class="control-group">
+                <label for="ttsService">TTS Service URL:</label>
+                <input type="url" id="ttsService" placeholder="https://your-tts-service.com/synthesize">
+            </div>
+            <button id="generateTTS">Generate Speech</button>
+        </div>
+
+        <!-- Controls Section -->
+        <div class="section">
+            <h2>⚙️ Controls</h2>
+            <button id="enableInjection">Enable Injection</button>
+            <button id="disableInjection">Disable Injection</button>
+            <button id="clearLog">Clear Log</button>
+        </div>
+
+        <!-- Log Section -->
+        <div class="section">
+            <h2>📋 Activity Log</h2>
+            <div id="log" class="log"></div>
+        </div>
+    </div>
+
+    <script src="audio_injection_example.js"></script>
+    <script>
+        let injector = null;
+        let isRecording = false;
+        let mediaRecorder = null;
+        let recordingStream = null;
+
+        // DOM elements
+        const elements = {
+            websocketUrl: document.getElementById('websocketUrl'),
+            connectBtn: document.getElementById('connectBtn'),
+            disconnectBtn: document.getElementById('disconnectBtn'),
+            connectionStatus: document.getElementById('connectionStatus'),
+            audioFileInput: document.getElementById('audioFileInput'),
+            fileDrop: document.getElementById('fileDrop'),
+            fileFormat: document.getElementById('fileFormat'),
+            frequency: document.getElementById('frequency'),
+            duration: document.getElementById('duration'),
+            volume: document.getElementById('volume'),
+            generateTone: document.getElementById('generateTone'),
+            generateDTMF1: document.getElementById('generateDTMF1'),
+            generateDTMF0: document.getElementById('generateDTMF0'),
+            generateBeep: document.getElementById('generateBeep'),
+            recordDuration: document.getElementById('recordDuration'),
+            startRecording: document.getElementById('startRecording'),
+            stopRecording: document.getElementById('stopRecording'),
+            recordingStatus: document.getElementById('recordingStatus'),
+            audioUrl: document.getElementById('audioUrl'),
+            playFromUrl: document.getElementById('playFromUrl'),
+            ttsText: document.getElementById('ttsText'),
+            ttsService: document.getElementById('ttsService'),
+            generateTTS: document.getElementById('generateTTS'),
+            enableInjection: document.getElementById('enableInjection'),
+            disableInjection: document.getElementById('disableInjection'),
+            clearLog: document.getElementById('clearLog'),
+            log: document.getElementById('log')
+        };
+
+        // Logging function
+        function log(message) {
+            const timestamp = new Date().toLocaleTimeString();
+            elements.log.textContent += `[${timestamp}] ${message}\n`;
+            elements.log.scrollTop = elements.log.scrollHeight;
+        }
+
+        // Connection handlers
+        elements.connectBtn.addEventListener('click', () => {
+            const url = elements.websocketUrl.value;
+            if (!url) {
+                log('Please enter a WebSocket URL');
+                return;
+            }
+
+            log(`Connecting to ${url}...`);
+            injector = new AudioInjector(url);
+            
+            // Override the WebSocket handlers to update UI
+            const originalSetup = injector.setupWebSocket;
+            injector.setupWebSocket = function() {
+                originalSetup.call(this);
+                
+                this.websocket.onopen = () => {
+                    log('WebSocket connected successfully');
+                    this.isConnected = true;
+                    updateConnectionStatus(true);
+                };
+                
+                this.websocket.onclose = () => {
+                    log('WebSocket disconnected');
+                    this.isConnected = false;
+                    updateConnectionStatus(false);
+                };
+                
+                this.websocket.onerror = (error) => {
+                    log(`WebSocket error: ${error.message || 'Unknown error'}`);
+                };
+            };
+            
+            injector.setupWebSocket();
+        });
+
+        elements.disconnectBtn.addEventListener('click', () => {
+            if (injector) {
+                injector.disconnect();
+                injector = null;
+                log('Disconnected from WebSocket');
+                updateConnectionStatus(false);
+            }
+        });
+
+        function updateConnectionStatus(connected) {
+            elements.connectionStatus.textContent = connected ? 'Connected' : 'Disconnected';
+            elements.connectionStatus.className = `status ${connected ? 'connected' : 'disconnected'}`;
+            elements.connectBtn.disabled = connected;
+            elements.disconnectBtn.disabled = !connected;
+        }
+
+        // File handling
+        elements.fileDrop.addEventListener('click', () => {
+            elements.audioFileInput.click();
+        });
+
+        elements.fileDrop.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            elements.fileDrop.classList.add('dragover');
+        });
+
+        elements.fileDrop.addEventListener('dragleave', () => {
+            elements.fileDrop.classList.remove('dragover');
+        });
+
+        elements.fileDrop.addEventListener('drop', (e) => {
+            e.preventDefault();
+            elements.fileDrop.classList.remove('dragover');
+            const files = e.dataTransfer.files;
+            if (files.length > 0) {
+                handleFileSelection(files[0]);
+            }
+        });
+
+        elements.audioFileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                handleFileSelection(e.target.files[0]);
+            }
+        });
+
+        function handleFileSelection(file) {
+            if (!injector || !injector.isConnected) {
+                log('Not connected to WebSocket');
+                return;
+            }
+
+            log(`Selected file: ${file.name} (${file.size} bytes)`);
+            injector.injectAudioFile(file);
+        }
+
+        // Tone generation
+        elements.generateTone.addEventListener('click', () => {
+            if (!injector || !injector.isConnected) {
+                log('Not connected to WebSocket');
+                return;
+            }
+
+            const freq = parseInt(elements.frequency.value);
+            const dur = parseFloat(elements.duration.value);
+            log(`Generating ${freq}Hz tone for ${dur} seconds`);
+            injector.injectTone(freq, dur);
+        });
+
+        elements.generateDTMF1.addEventListener('click', () => {
+            if (!injector || !injector.isConnected) return;
+            log('Generating DTMF tone for digit 1');
+            injector.injectTone(697, 0.2); // DTMF 1: 697Hz + 1209Hz (simplified to single tone)
+        });
+
+        elements.generateDTMF0.addEventListener('click', () => {
+            if (!injector || !injector.isConnected) return;
+            log('Generating DTMF tone for digit 0');
+            injector.injectTone(941, 0.2); // DTMF 0: 941Hz + 1336Hz (simplified to single tone)
+        });
+
+        elements.generateBeep.addEventListener('click', () => {
+            if (!injector || !injector.isConnected) return;
+            log('Generating beep sound');
+            injector.injectTone(800, 0.5);
+        });
+
+        // Recording
+        elements.startRecording.addEventListener('click', async () => {
+            if (!injector || !injector.isConnected) {
+                log('Not connected to WebSocket');
+                return;
+            }
+
+            const duration = parseInt(elements.recordDuration.value) * 1000;
+            log(`Starting recording for ${duration/1000} seconds...`);
+            
+            elements.startRecording.disabled = true;
+            elements.stopRecording.disabled = false;
+            elements.recordingStatus.textContent = 'Recording...';
+            
+            await injector.recordAndInject(duration);
+            
+            setTimeout(() => {
+                elements.startRecording.disabled = false;
+                elements.stopRecording.disabled = true;
+                elements.recordingStatus.textContent = '';
+                log('Recording completed and injected');
+            }, duration);
+        });
+
+        // URL audio
+        elements.playFromUrl.addEventListener('click', () => {
+            if (!injector || !injector.isConnected) {
+                log('Not connected to WebSocket');
+                return;
+            }
+
+            const url = elements.audioUrl.value;
+            if (!url) {
+                log('Please enter an audio URL');
+                return;
+            }
+
+            log(`Injecting audio from URL: ${url}`);
+            injector.injectAudioFromUrl(url);
+        });
+
+        // TTS
+        elements.generateTTS.addEventListener('click', () => {
+            if (!injector || !injector.isConnected) {
+                log('Not connected to WebSocket');
+                return;
+            }
+
+            const text = elements.ttsText.value;
+            const serviceUrl = elements.ttsService.value;
+
+            if (!text) {
+                log('Please enter text to speak');
+                return;
+            }
+
+            if (!serviceUrl) {
+                log('Please enter TTS service URL');
+                return;
+            }
+
+            log(`Generating TTS for: "${text}"`);
+            injector.injectTTS(text, serviceUrl);
+        });
+
+        // Controls
+        elements.enableInjection.addEventListener('click', () => {
+            log('Audio injection enabled');
+        });
+
+        elements.disableInjection.addEventListener('click', () => {
+            log('Audio injection disabled');
+        });
+
+        elements.clearLog.addEventListener('click', () => {
+            elements.log.textContent = '';
+        });
+
+        // Initialize
+        log('Audio Injection Demo initialized');
+        log('Connect to WebSocket to start injecting audio');
+    </script>
+</body>
+</html>

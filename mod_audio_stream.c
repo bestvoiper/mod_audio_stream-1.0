@@ -45,6 +45,14 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
             break;
 
         case SWITCH_ABC_TYPE_WRITE:
+            // Handle audio injection for playback
+            if (tech_pvt && !tech_pvt->close_requested && tech_pvt->inject_audio_enabled) {
+                switch_frame_t *frame = switch_core_media_bug_get_write_replace_frame(bug);
+                if (frame && process_injected_audio(session, frame) == SWITCH_STATUS_SUCCESS) {
+                    switch_core_media_bug_set_write_replace_frame(bug, frame);
+                }
+            }
+            break;
         default:
             break;
     }
@@ -135,7 +143,17 @@ static switch_status_t send_text(switch_core_session_t *session, char* text) {
     return status;
 }
 
-#define STREAM_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000] [metadata]"
+static switch_status_t do_enable_injection(switch_core_session_t *session, int enable)
+{
+    switch_status_t status = SWITCH_STATUS_SUCCESS;
+
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: %s audio injection\n", enable ? "enabling" : "disabling");
+    status = enable_audio_injection(session, enable);
+
+    return status;
+}
+
+#define STREAM_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | enable_inject | disable_inject | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000] [metadata]"
 SWITCH_STANDARD_API(stream_function)
 {
     char *mycmd = NULL, *argv[6] = { 0 };
@@ -182,6 +200,10 @@ SWITCH_STANDARD_API(stream_function)
                     goto done;
                 }
                 status = send_text(lsession, argv[2]);
+            } else if (!strcasecmp(argv[1], "enable_inject")) {
+                status = do_enable_injection(lsession, 1);
+            } else if (!strcasecmp(argv[1], "disable_inject")) {
+                status = do_enable_injection(lsession, 0);
             } else if (!strcasecmp(argv[1], "start")) {
                 //switch_channel_t *channel = switch_core_session_get_channel(lsession);
                 char wsUri[MAX_WS_URI];
@@ -277,6 +299,8 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_stream_load)
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid pause");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid resume");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid send_text");
+    switch_console_set_complete("add uuid_audio_stream ::console::list_uuid enable_inject");
+    switch_console_set_complete("add uuid_audio_stream ::console::list_uuid disable_inject");
 
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_stream API successfully loaded\n");
 

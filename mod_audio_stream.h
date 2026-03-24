@@ -34,6 +34,14 @@ struct private_data {
     switch_buffer_t *sbuffer;
     uint8_t *data;
     int rtp_packets;
+    
+    // Audio injection support
+    switch_buffer_t *inject_buffer;          // Buffer for injected audio
+    switch_mutex_t *inject_mutex;            // Mutex for inject buffer access
+    SpeexResamplerState *inject_resampler;   // Resampler for injected audio
+    int inject_audio_enabled:1;              // Flag to enable audio injection
+    int inject_sample_rate;                  // Sample rate of injected audio
+    int inject_channels;                     // Channels of injected audio
 };
 
 typedef struct private_data private_t;

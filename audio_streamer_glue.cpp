@@ -627,6 +627,15 @@ namespace {
         aStreamer.reset((AudioStreamer *)tech_pvt->pAudioStreamer);
         tech_pvt->pAudioStreamer = nullptr;
 
+        // Immediately remove session from g_active_sessions to prevent race condition
+        // when a new session with the same UUID is started before this thread completes
+        {
+            std::lock_guard<std::mutex> lock(g_channel_mutex);
+            g_active_sessions.erase(tech_pvt->sessionId);
+            DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "Removed session %s from active sessions in finish(). Remaining: %zu", 
+                           tech_pvt->sessionId, g_active_sessions.size());
+        }
+
         std::thread t([aStreamer]{
             aStreamer->disconnect();
         });
@@ -1197,4 +1206,3 @@ extern "C" {
         return SWITCH_STATUS_SUCCESS;
     }
 }
-
