@@ -218,6 +218,10 @@ public:
             });
 
             DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "Starting WebSocket for session %s", uuid);
+            
+            // Set connection timeout to 10 seconds (default is 5)
+            webSocket.setConnectionTimeout(10);
+            
             webSocket.connect();
             
         } catch (const std::exception& e) {
@@ -1155,9 +1159,17 @@ extern "C" {
             return SWITCH_STATUS_FALSE;
         }
 
+        // IMPORTANT: Clear private data FIRST to prevent "bug already attached" errors
+        // on rapid stop/start sequences
+        switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
+
         auto* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
         if (!tech_pvt) {
             DEBUG_LOG(DEBUG_LEVEL_ERROR, session, "No tech_pvt found");
+            // Remove the bug even without tech_pvt
+            if (!channelIsClosing) {
+                switch_core_media_bug_remove(session, &bug);
+            }
             return SWITCH_STATUS_FALSE;
         }
 
@@ -1171,6 +1183,10 @@ extern "C" {
         // Prevent multiple cleanup calls
         if (tech_pvt->close_requested) {
             DEBUG_LOG(DEBUG_LEVEL_DEBUG, session, "Cleanup already in progress for session %s", sessionId);
+            // Still need to remove the bug if not closing
+            if (!channelIsClosing) {
+                switch_core_media_bug_remove(session, &bug);
+            }
             return SWITCH_STATUS_SUCCESS;
         }
         
@@ -1181,8 +1197,7 @@ extern "C" {
             switch_mutex_lock(tech_pvt->mutex);
         }
 
-        switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
-        
+        // Remove the bug AFTER setting close_requested to avoid race in callback
         if (!channelIsClosing) {
             switch_core_media_bug_remove(session, &bug);
         }
