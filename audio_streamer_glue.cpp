@@ -247,12 +247,55 @@ public:
     }
 
     inline void media_bug_close(switch_core_session_t *session) {
-        auto *bug = get_media_bug(session);
-        if(bug) {
-            auto* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
-            tech_pvt->close_requested = 1;
-            switch_core_media_bug_close(&bug, SWITCH_FALSE);
+        switch_channel_t *channel = switch_core_session_get_channel(session);
+        if (!channel) {
+            return;
         }
+        
+        auto *bug = (switch_media_bug_t *) switch_channel_get_private(channel, MY_BUG_NAME);
+        if(!bug) {
+            return;
+        }
+        
+        auto* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt) {
+            switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
+            switch_core_media_bug_close(&bug, SWITCH_FALSE);
+            return;
+        }
+        
+        // Prevent multiple cleanup calls
+        if (tech_pvt->close_requested) {
+            return;
+        }
+        tech_pvt->close_requested = 1;
+        
+        // Clear private data FIRST to prevent "bug already attached" errors
+        switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
+        
+        // Do the actual cleanup
+        if (tech_pvt->mutex) {
+            switch_mutex_lock(tech_pvt->mutex);
+        }
+        
+        auto* audioStreamer = (AudioStreamer *) tech_pvt->pAudioStreamer;
+        if (audioStreamer) {
+            audioStreamer->deleteFiles();
+            finish(tech_pvt);
+        }
+        
+        if (tech_pvt->mutex) {
+            switch_mutex_unlock(tech_pvt->mutex);
+        }
+        
+        // Close the bug - SWITCH_ABC_TYPE_CLOSE callback will find no bug and return early
+        switch_core_media_bug_close(&bug, SWITCH_FALSE);
+        
+        // Final cleanup
+        destroy_tech_pvt(tech_pvt);
+        
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, 
+            "media_bug_close: cleanup completed\n");
     }
 
     inline void send_initial_metadata(switch_core_session_t *session) {
