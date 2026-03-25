@@ -66,6 +66,9 @@ static std::atomic<int> g_debug_level{DEBUG_LEVEL_WARNING}; // Default to WARNIN
 
 namespace {
     extern switch_bool_t filter_json_string(switch_core_session_t *session, const char* message);
+    // Forward declarations for cleanup functions
+    void finish(private_t* tech_pvt);
+    void destroy_tech_pvt(private_t* tech_pvt);
 }
 
 // Forward declarations for functions used in cleanup
