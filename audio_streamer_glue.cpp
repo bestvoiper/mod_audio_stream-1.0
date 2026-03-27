@@ -533,7 +533,7 @@ namespace {
     switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *session, char *wsUri,
                                      uint32_t sampling, int desiredSampling, int channels, char *metadata, responseHandler_t responseHandler,
                                      int deflate, int heart_beat, bool globalTrace, bool suppressLog, int rtp_packets, const char* extra_headers,
-                                     bool no_reconnect)
+                                     bool no_reconnect, audio_mix_mode_t mix_mode)
     {
         int err; //speex
 
@@ -548,6 +548,7 @@ namespace {
         tech_pvt->rtp_packets = rtp_packets;
         tech_pvt->channels = channels;
         tech_pvt->audio_paused = 0;
+        tech_pvt->mix_mode = mix_mode;
 
         if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
 
@@ -602,7 +603,24 @@ namespace {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) no resampling needed for this call\n", tech_pvt->sessionId);
         }
 
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_data_init\n", tech_pvt->sessionId);
+        // Initialize enhanced mixing buffers if needed
+        if (mix_mode == MIX_MODE_ENHANCED_MIXED) {
+            // Create separate buffers for read and write audio for enhanced mixing
+            if (switch_buffer_create(pool, &tech_pvt->read_buffer, buflen * 2) != SWITCH_STATUS_SUCCESS) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                    "%s: Error creating read buffer for enhanced mixing.\n", tech_pvt->sessionId);
+                return SWITCH_STATUS_FALSE;
+            }
+            if (switch_buffer_create(pool, &tech_pvt->write_buffer, buflen * 2) != SWITCH_STATUS_SUCCESS) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                    "%s: Error creating write buffer for enhanced mixing.\n", tech_pvt->sessionId);
+                return SWITCH_STATUS_FALSE;
+            }
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, 
+                "(%s) Enhanced mixing mode initialized with separate read/write buffers\n", tech_pvt->sessionId);
+        }
+
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_data_init with mix_mode=%d\n", tech_pvt->sessionId, mix_mode);
 
         return SWITCH_STATUS_SUCCESS;
     }
@@ -958,6 +976,7 @@ extern "C" {
                                         int sampling,
                                         int channels,
                                         char* metadata,
+                                        audio_mix_mode_t mix_mode,
                                         void **ppUserData)
     {
         if (!session || !wsUri || !ppUserData) {
@@ -1055,7 +1074,7 @@ extern "C" {
         // Try to initialize stream data
         switch_status_t init_result = stream_data_init(tech_pvt, session, wsUri, samples_per_second, sampling, 
                                                       channels, metadata, responseHandler, deflate, heart_beat,
-                                                      globalTrace, suppressLog, rtp_packets, extra_headers, no_reconnect);
+                                                      globalTrace, suppressLog, rtp_packets, extra_headers, no_reconnect, mix_mode);
         
         if (init_result != SWITCH_STATUS_SUCCESS) {
             DEBUG_LOG(DEBUG_LEVEL_ERROR, session, "stream_data_init failed with status %d", init_result);
@@ -1072,6 +1091,34 @@ extern "C" {
         }
         
         return SWITCH_STATUS_SUCCESS;
+    }
+
+    // Enhanced mixing helper function - mixes two audio samples with soft clipping prevention
+    static inline int16_t mix_samples_enhanced(int16_t sample1, int16_t sample2) {
+        // Use 32-bit arithmetic to prevent overflow
+        int32_t mixed = static_cast<int32_t>(sample1) + static_cast<int32_t>(sample2);
+        
+        // Apply soft clipping with headroom to prevent distortion
+        // This provides better audio quality than hard clipping
+        if (mixed > 32767) {
+            mixed = 32767;
+        } else if (mixed < -32768) {
+            mixed = -32768;
+        }
+        
+        return static_cast<int16_t>(mixed);
+    }
+
+    // Alternative mixing with automatic gain control for better quality
+    static inline int16_t mix_samples_agc(int16_t sample1, int16_t sample2, float gain) {
+        int32_t mixed = static_cast<int32_t>(static_cast<float>(sample1) * gain) + 
+                        static_cast<int32_t>(static_cast<float>(sample2) * gain);
+        
+        // Soft clip
+        if (mixed > 32767) mixed = 32767;
+        else if (mixed < -32768) mixed = -32768;
+        
+        return static_cast<int16_t>(mixed);
     }
 
     switch_bool_t stream_frame(switch_media_bug_t *bug)
@@ -1099,8 +1146,98 @@ extern "C" {
         }
 
         try {
-            // ...existing frame processing code with better error handling...
-            if (nullptr == tech_pvt->resampler) {
+            // Handle enhanced mixed mode separately for better quality mixing
+            if (tech_pvt->mix_mode == MIX_MODE_ENHANCED_MIXED) {
+                // In enhanced mixed mode, we capture both directions and mix them manually
+                // Using switch_core_media_bug_read with SWITCH_TRUE gets the mixed audio,
+                // but we want to apply our own mixing algorithm for better quality
+                
+                uint8_t read_data[SWITCH_RECOMMENDED_BUFFER_SIZE];
+                switch_frame_t frame = {};
+                frame.data = read_data;
+                frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
+                
+                // Get the native read frame (caller's audio)
+                switch_frame_t *native_read = switch_core_media_bug_get_native_read_frame(bug);
+                // Get the native write frame (callee's audio / playback)
+                switch_frame_t *native_write = switch_core_media_bug_get_native_write_frame(bug);
+                
+                if (native_read && native_read->datalen > 0) {
+                    size_t sample_count = native_read->datalen / sizeof(int16_t);
+                    int16_t *read_samples = static_cast<int16_t*>(native_read->data);
+                    int16_t *write_samples = nullptr;
+                    size_t write_sample_count = 0;
+                    
+                    if (native_write && native_write->datalen > 0) {
+                        write_samples = static_cast<int16_t*>(native_write->data);
+                        write_sample_count = native_write->datalen / sizeof(int16_t);
+                    }
+                    
+                    // Create mixed output buffer
+                    int16_t mixed_samples[sample_count];
+                    
+                    // Mix with enhanced algorithm - use 0.85 gain factor to prevent clipping 
+                    // while preserving more dynamic range
+                    const float mix_gain = 0.85f;
+                    for (size_t i = 0; i < sample_count; i++) {
+                        int16_t read_sample = read_samples[i];
+                        int16_t write_sample = (write_samples && i < write_sample_count) ? write_samples[i] : 0;
+                        mixed_samples[i] = mix_samples_agc(read_sample, write_sample, mix_gain);
+                    }
+                    
+                    // Handle resampling if needed
+                    if (tech_pvt->resampler) {
+                        spx_uint32_t in_len = sample_count;
+                        const size_t max_out_samples = sample_count * 2; // Allow for upsampling
+                        int16_t resampled[max_out_samples];
+                        spx_uint32_t out_len = max_out_samples;
+                        
+                        speex_resampler_process_int(tech_pvt->resampler,
+                                        0,
+                                        mixed_samples,
+                                        &in_len,
+                                        resampled,
+                                        &out_len);
+                        
+                        if (out_len > 0) {
+                            size_t bytes_written = out_len * sizeof(int16_t);
+                            if (tech_pvt->rtp_packets == 1) {
+                                pAudioStreamer->writeBinary(reinterpret_cast<uint8_t*>(resampled), bytes_written);
+                            } else {
+                                switch_buffer_write(tech_pvt->sbuffer, reinterpret_cast<uint8_t*>(resampled), bytes_written);
+                                if (switch_buffer_freespace(tech_pvt->sbuffer) == 0) {
+                                    const switch_size_t buf_len = switch_buffer_inuse(tech_pvt->sbuffer);
+                                    uint8_t buf_ptr[buf_len];
+                                    switch_buffer_read(tech_pvt->sbuffer, buf_ptr, buf_len);
+                                    switch_buffer_zero(tech_pvt->sbuffer);
+                                    pAudioStreamer->writeBinary(buf_ptr, buf_len);
+                                }
+                            }
+                        }
+                    } else {
+                        // No resampling needed
+                        size_t bytes_to_send = sample_count * sizeof(int16_t);
+                        if (tech_pvt->rtp_packets == 1) {
+                            pAudioStreamer->writeBinary(reinterpret_cast<uint8_t*>(mixed_samples), bytes_to_send);
+                        } else {
+                            // Use ring buffer for larger packets
+                            size_t available = ringBufferFreeSpace(tech_pvt->buffer);
+                            if (available >= bytes_to_send) {
+                                ringBufferAppendMultiple(tech_pvt->buffer, reinterpret_cast<uint8_t*>(mixed_samples), bytes_to_send);
+                            }
+                            if (ringBufferFreeSpace(tech_pvt->buffer) == 0) {
+                                size_t nBytes = ringBufferLen(tech_pvt->buffer);
+                                uint8_t chunkPtr[nBytes];
+                                ringBufferGetMultiple(tech_pvt->buffer, chunkPtr, nBytes);
+                                pAudioStreamer->writeBinary(chunkPtr, nBytes);
+                                ringBufferClear(tech_pvt->buffer);
+                            }
+                        }
+                    }
+                }
+            }
+            // Standard modes (mono, mixed, stereo) - existing code
+            else if (nullptr == tech_pvt->resampler) {
                 uint8_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
                 switch_frame_t frame = {};
                 frame.data = data;

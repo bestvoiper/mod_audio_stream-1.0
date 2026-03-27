@@ -64,7 +64,8 @@ static switch_status_t start_capture(switch_core_session_t *session,
                                      switch_media_bug_flag_t flags,
                                      char* wsUri,
                                      int sampling,
-                                     char* metadata)
+                                     char* metadata,
+                                     audio_mix_mode_t mix_mode)
 {
     switch_channel_t *channel = switch_core_session_get_channel(session);
     switch_media_bug_t *bug;
@@ -86,9 +87,9 @@ static switch_status_t start_capture(switch_core_session_t *session,
         return SWITCH_STATUS_FALSE;
     }
 
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "calling stream_session_init.\n");
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "calling stream_session_init with mix_mode=%d.\n", mix_mode);
     if (SWITCH_STATUS_FALSE == stream_session_init(session, responseHandler, read_codec->implementation->actual_samples_per_second,
-                                                 wsUri, sampling, channels, metadata, &pUserData)) {
+                                                 wsUri, sampling, channels, metadata, mix_mode, &pUserData)) {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing mod_audio_stream session.\n");
         return SWITCH_STATUS_FALSE;
     }
@@ -153,7 +154,7 @@ static switch_status_t do_enable_injection(switch_core_session_t *session, int e
     return status;
 }
 
-#define STREAM_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | enable_inject | disable_inject | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000] [metadata]"
+#define STREAM_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | enable_inject | disable_inject | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo | enhanced_mixed] [8000 | 16000] [metadata]"
 SWITCH_STANDARD_API(stream_function)
 {
     char *mycmd = NULL, *argv[6] = { 0 };
@@ -209,6 +210,7 @@ SWITCH_STANDARD_API(stream_function)
                 char wsUri[MAX_WS_URI];
                 int sampling = 8000;
                 switch_media_bug_flag_t flags = SMBF_READ_STREAM;
+                audio_mix_mode_t mix_mode = MIX_MODE_MONO;
                 char *metadata = argc > 5 ? argv[5] : NULL;
                 if(metadata && (is_valid_utf8(argv[2]) != SWITCH_STATUS_SUCCESS)) {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
@@ -218,12 +220,17 @@ SWITCH_STANDARD_API(stream_function)
                 }
                 if (0 == strcmp(argv[3], "mixed")) {
                     flags |= SMBF_WRITE_STREAM;
+                    mix_mode = MIX_MODE_MIXED;
                 } else if (0 == strcmp(argv[3], "stereo")) {
                     flags |= SMBF_WRITE_STREAM;
                     flags |= SMBF_STEREO;
+                    mix_mode = MIX_MODE_STEREO;
+                } else if (0 == strcmp(argv[3], "enhanced_mixed")) {
+                    flags |= SMBF_WRITE_STREAM;
+                    mix_mode = MIX_MODE_ENHANCED_MIXED;
                 } else if (0 != strcmp(argv[3], "mono")) {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                      "invalid mix type: %s, must be mono, mixed, or stereo\n", argv[3]);
+                                      "invalid mix type: %s, must be mono, mixed, stereo, or enhanced_mixed\n", argv[3]);
                     switch_core_session_rwunlock(lsession);
                     goto done;
                 }
@@ -243,7 +250,7 @@ SWITCH_STANDARD_API(stream_function)
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                                       "invalid sample rate: %s\n", argv[4]);
                 } else {
-                    status = start_capture(lsession, flags, wsUri, sampling, metadata);
+                    status = start_capture(lsession, flags, wsUri, sampling, metadata, mix_mode);
                 }
             } else {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
