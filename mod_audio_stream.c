@@ -45,13 +45,25 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
             break;
 
         case SWITCH_ABC_TYPE_WRITE_REPLACE:
-        case SWITCH_ABC_TYPE_WRITE:
-            // Handle audio injection for playback. WRITE_REPLACE is the expected callback
-            // when SMBF_WRITE_REPLACE is enabled; WRITE is kept for compatibility.
+            // Preferred injection path: replace outbound audio frame.
             if (tech_pvt && !tech_pvt->close_requested && tech_pvt->inject_audio_enabled) {
                 switch_frame_t *frame = switch_core_media_bug_get_write_replace_frame(bug);
+                if (!frame) {
+                    // Fallback for endpoints that do not expose replace frame consistently.
+                    frame = switch_core_media_bug_get_native_write_frame(bug);
+                }
                 if (frame && process_injected_audio(session, frame) == SWITCH_STATUS_SUCCESS) {
                     switch_core_media_bug_set_write_replace_frame(bug, frame);
+                }
+            }
+            break;
+
+        case SWITCH_ABC_TYPE_WRITE:
+            // Compatibility path: mutate native write frame when replace frame is unavailable.
+            if (tech_pvt && !tech_pvt->close_requested && tech_pvt->inject_audio_enabled) {
+                switch_frame_t *frame = switch_core_media_bug_get_native_write_frame(bug);
+                if (frame) {
+                    process_injected_audio(session, frame);
                 }
             }
             break;
