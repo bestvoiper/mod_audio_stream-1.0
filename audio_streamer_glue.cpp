@@ -22,6 +22,7 @@
 #include "base64.h"
 
 #define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
+#define INJECT_BUFFER_MULTIPLIER 100 /* keep about 2 seconds at 16k/20ms chunks when rtp_packets=1 */
 
 // Debug level constants
 #define DEBUG_LEVEL_NONE     0
@@ -652,7 +653,7 @@ namespace {
         }
 
         // Initialize audio injection resources.
-        if (switch_buffer_create(pool, &tech_pvt->inject_buffer, buflen * 4) != SWITCH_STATUS_SUCCESS) {
+        if (switch_buffer_create(pool, &tech_pvt->inject_buffer, buflen * INJECT_BUFFER_MULTIPLIER) != SWITCH_STATUS_SUCCESS) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                               "%s: Error creating injection buffer.\n", tech_pvt->sessionId);
             return SWITCH_STATUS_FALSE;
@@ -1573,17 +1574,42 @@ extern "C" {
         }
 
         switch_mutex_lock(tech_pvt->inject_mutex);
-        const switch_size_t free_bytes = switch_buffer_freespace(tech_pvt->inject_buffer);
-        const switch_size_t bytes_to_write = static_cast<switch_size_t>((input_len <= free_bytes) ? input_len : free_bytes);
+        switch_size_t in_use = switch_buffer_inuse(tech_pvt->inject_buffer);
+        switch_size_t free_bytes = switch_buffer_freespace(tech_pvt->inject_buffer);
+        const switch_size_t capacity = in_use + free_bytes;
 
+        const uint8_t *write_ptr = input_ptr;
+        switch_size_t write_len = static_cast<switch_size_t>(input_len);
+
+        // If incoming chunk is larger than total buffer capacity, keep only newest tail.
+        if (write_len > capacity) {
+            write_ptr = input_ptr + (write_len - capacity);
+            write_len = capacity;
+        }
+
+        if (write_len > free_bytes) {
+            const switch_size_t bytes_to_drop = write_len - free_bytes;
+            std::vector<uint8_t> drop_tmp(bytes_to_drop);
+            const switch_size_t dropped = switch_buffer_read(tech_pvt->inject_buffer, drop_tmp.data(), bytes_to_drop);
+            if (dropped < bytes_to_drop) {
+                switch_buffer_zero(tech_pvt->inject_buffer);
+                in_use = 0;
+                free_bytes = switch_buffer_freespace(tech_pvt->inject_buffer);
+            } else {
+                in_use = switch_buffer_inuse(tech_pvt->inject_buffer);
+                free_bytes = switch_buffer_freespace(tech_pvt->inject_buffer);
+            }
+        }
+
+        const switch_size_t bytes_to_write = (write_len <= free_bytes) ? write_len : free_bytes;
         if (bytes_to_write > 0) {
-            switch_buffer_write(tech_pvt->inject_buffer, input_ptr, bytes_to_write);
+            switch_buffer_write(tech_pvt->inject_buffer, write_ptr, bytes_to_write);
         }
         switch_mutex_unlock(tech_pvt->inject_mutex);
 
         if (bytes_to_write == 0) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-                "(%s) inject_audio_data: inject buffer full, dropping %zu bytes\n",
+                "(%s) inject_audio_data: no space after recovery, dropping %zu bytes\n",
                 tech_pvt->sessionId, input_len);
             return SWITCH_STATUS_FALSE;
         }

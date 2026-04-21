@@ -44,8 +44,10 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
             return stream_frame(bug);
             break;
 
+        case SWITCH_ABC_TYPE_WRITE_REPLACE:
         case SWITCH_ABC_TYPE_WRITE:
-            // Handle audio injection for playback
+            // Handle audio injection for playback. WRITE_REPLACE is the expected callback
+            // when SMBF_WRITE_REPLACE is enabled; WRITE is kept for compatibility.
             if (tech_pvt && !tech_pvt->close_requested && tech_pvt->inject_audio_enabled) {
                 switch_frame_t *frame = switch_core_media_bug_get_write_replace_frame(bug);
                 if (frame && process_injected_audio(session, frame) == SWITCH_STATUS_SUCCESS) {
