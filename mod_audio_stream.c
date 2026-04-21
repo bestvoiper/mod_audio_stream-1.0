@@ -209,7 +209,7 @@ SWITCH_STANDARD_API(stream_function)
                 //switch_channel_t *channel = switch_core_session_get_channel(lsession);
                 char wsUri[MAX_WS_URI];
                 int sampling = 8000;
-                switch_media_bug_flag_t flags = SMBF_READ_STREAM;
+                switch_media_bug_flag_t flags = SMBF_READ_STREAM | SMBF_WRITE_REPLACE;
                 audio_mix_mode_t mix_mode = MIX_MODE_MONO;
                 char *metadata = argc > 5 ? argv[5] : NULL;
                 if(metadata && (is_valid_utf8(argv[2]) != SWITCH_STATUS_SUCCESS)) {

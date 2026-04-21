@@ -18,6 +18,7 @@
 #include <unordered_set>
 #include <atomic>
 #include <mutex>
+#include <vector>
 #include "base64.h"
 
 #define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
@@ -359,20 +360,16 @@ public:
                 cJSON* jsonAudio = cJSON_DetachItemFromObject(jsonData, "audioData");
                 const char* jsAudioDataType = cJSON_GetObjectCstr(jsonData, "audioDataType");
                 std::string fileType;
-                int sampleRate;
-                if (0 == strcmp(jsAudioDataType, "raw")) {
+                int sampleRate = 0;
+                int channels = 1;
+                if (!jsAudioDataType) {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                      "(%s) processMessage - missing audioDataType\n", m_sessionId.c_str());
+                } else if (0 == strcmp(jsAudioDataType, "raw")) {
                     cJSON* jsonSampleRate = cJSON_GetObjectItem(jsonData, "sampleRate");
                     sampleRate = jsonSampleRate && jsonSampleRate->valueint ? jsonSampleRate->valueint : 0;
-                    std::unordered_map<int, const char*> sampleRateMap = {
-                            {8000, ".r8"},
-                            {16000, ".r16"},
-                            {24000, ".r24"},
-                            {32000, ".r32"},
-                            {48000, ".r48"},
-                            {64000, ".r64"}
-                    };
-                    auto it = sampleRateMap.find(sampleRate);
-                    fileType = (it != sampleRateMap.end()) ? it->second : "";
+                    cJSON* jsonChannels = cJSON_GetObjectItem(jsonData, "channels");
+                    channels = jsonChannels && jsonChannels->valueint ? jsonChannels->valueint : 1;
                 } else if (0 == strcmp(jsAudioDataType, "wav")) {
                     fileType = ".wav";
                 } else if (0 == strcmp(jsAudioDataType, "mp3")) {
@@ -384,8 +381,7 @@ public:
                                       m_sessionId.c_str(), jsAudioDataType);
                 }
 
-                if(jsonAudio && jsonAudio->valuestring != nullptr && !fileType.empty()) {
-                    char filePath[256];
+                if(jsonAudio && jsonAudio->valuestring != nullptr) {
                     std::string rawAudio;
                     try {
                         rawAudio = base64_decode(jsonAudio->valuestring);
@@ -395,18 +391,51 @@ public:
                         cJSON_Delete(jsonAudio); cJSON_Delete(json);
                         return status;
                     }
-                    switch_snprintf(filePath, 256, "%s%s%s_%d.tmp%s", SWITCH_GLOBAL_dirs.temp_dir,
-                                    SWITCH_PATH_SEPARATOR, m_sessionId.c_str(), m_playFile++, fileType.c_str());
-                    std::ofstream fstream(filePath, std::ofstream::binary);
-                    if (fstream.is_open()) {
-                        fstream << rawAudio;
-                        fstream.close();
-                        m_Files.insert(filePath);
-                        jsonFile = cJSON_CreateString(filePath);
-                        cJSON_AddItemToObject(jsonData, "file", jsonFile);
+
+                    if (jsAudioDataType && 0 == strcmp(jsAudioDataType, "raw")) {
+                        if (sampleRate <= 0) {
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                              "(%s) processMessage - invalid sampleRate for raw audio\n",
+                                              m_sessionId.c_str());
+                        } else {
+                            if (inject_audio_data(session,
+                                                  reinterpret_cast<const uint8_t *>(rawAudio.data()),
+                                                  rawAudio.size(),
+                                                  sampleRate,
+                                                  channels) == SWITCH_STATUS_SUCCESS) {
+                                status = SWITCH_TRUE;
+                            } else {
+                                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                                  "(%s) processMessage - inject_audio_data failed\n",
+                                                  m_sessionId.c_str());
+                            }
+                        }
                     } else {
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%s) processMessage - failed to create file: %s\n",
-                                          m_sessionId.c_str(), filePath);
+                        if (fileType.empty()) {
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                              "(%s) processMessage - unsupported or invalid audioDataType\n",
+                                              m_sessionId.c_str());
+                            if (jsonAudio)
+                                cJSON_Delete(jsonAudio);
+                            cJSON_Delete(json);
+                            return status;
+                        }
+
+                        char filePath[256];
+                        switch_snprintf(filePath, 256, "%s%s%s_%d.tmp%s", SWITCH_GLOBAL_dirs.temp_dir,
+                                        SWITCH_PATH_SEPARATOR, m_sessionId.c_str(), m_playFile++, fileType.c_str());
+                        std::ofstream fstream(filePath, std::ofstream::binary);
+                        if (fstream.is_open()) {
+                            fstream << rawAudio;
+                            fstream.close();
+                            m_Files.insert(filePath);
+                            jsonFile = cJSON_CreateString(filePath);
+                            cJSON_AddItemToObject(jsonData, "file", jsonFile);
+                        } else {
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                              "(%s) processMessage - failed to create file: %s\n",
+                                              m_sessionId.c_str(), filePath);
+                        }
                     }
                 }
 
@@ -620,6 +649,17 @@ namespace {
                 "(%s) Enhanced mixing mode initialized with separate read/write buffers\n", tech_pvt->sessionId);
         }
 
+        // Initialize audio injection resources.
+        if (switch_buffer_create(pool, &tech_pvt->inject_buffer, buflen * 4) != SWITCH_STATUS_SUCCESS) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "%s: Error creating injection buffer.\n", tech_pvt->sessionId);
+            return SWITCH_STATUS_FALSE;
+        }
+        switch_mutex_init(&tech_pvt->inject_mutex, SWITCH_MUTEX_NESTED, pool);
+        tech_pvt->inject_audio_enabled = 0;
+        tech_pvt->inject_sample_rate = desiredSampling;
+        tech_pvt->inject_channels = 1;
+
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_data_init with mix_mode=%d\n", tech_pvt->sessionId, mix_mode);
 
         return SWITCH_STATUS_SUCCESS;
@@ -650,6 +690,12 @@ namespace {
             speex_resampler_destroy(tech_pvt->resampler);
             tech_pvt->resampler = nullptr;
             DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "Destroyed resampler for session %s", tech_pvt->sessionId);
+        }
+
+        if (tech_pvt->inject_resampler) {
+            speex_resampler_destroy(tech_pvt->inject_resampler);
+            tech_pvt->inject_resampler = nullptr;
+            DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "Destroyed inject resampler for session %s", tech_pvt->sessionId);
         }
         
         // Clean up AudioStreamer
@@ -1454,10 +1500,94 @@ extern "C" {
         if (!tech_pvt || !tech_pvt->inject_audio_enabled) {
             return SWITCH_STATUS_FALSE;
         }
+
+        if (!tech_pvt->inject_buffer || !tech_pvt->inject_mutex) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                "(%s) inject_audio_data: injection not initialized\n", tech_pvt->sessionId);
+            return SWITCH_STATUS_FALSE;
+        }
+
+        if (sample_rate <= 0) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        const uint8_t* input_ptr = audio_data;
+        size_t input_len = data_len;
+        std::vector<int16_t> mono_samples;
+        std::vector<int16_t> resampled_samples;
+
+        if (channels > 1) {
+            const size_t frames = data_len / (sizeof(int16_t) * channels);
+            mono_samples.resize(frames);
+            const int16_t *in = reinterpret_cast<const int16_t *>(audio_data);
+            for (size_t i = 0; i < frames; ++i) {
+                int32_t acc = 0;
+                for (int c = 0; c < channels; ++c) {
+                    acc += in[i * channels + c];
+                }
+                mono_samples[i] = static_cast<int16_t>(acc / channels);
+            }
+            input_ptr = reinterpret_cast<const uint8_t *>(mono_samples.data());
+            input_len = mono_samples.size() * sizeof(int16_t);
+            channels = 1;
+        }
+
+        const int out_rate = tech_pvt->sampling > 0 ? tech_pvt->sampling : sample_rate;
+        if (sample_rate != out_rate) {
+            int err = 0;
+            if (!tech_pvt->inject_resampler || tech_pvt->inject_sample_rate != sample_rate) {
+                if (tech_pvt->inject_resampler) {
+                    speex_resampler_destroy(tech_pvt->inject_resampler);
+                    tech_pvt->inject_resampler = nullptr;
+                }
+                tech_pvt->inject_resampler = speex_resampler_init(1,
+                                                                   static_cast<spx_uint32_t>(sample_rate),
+                                                                   static_cast<spx_uint32_t>(out_rate),
+                                                                   SWITCH_RESAMPLE_QUALITY,
+                                                                   &err);
+                if (err != 0 || !tech_pvt->inject_resampler) {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                        "(%s) inject_audio_data: failed to init inject resampler: %s\n",
+                        tech_pvt->sessionId, speex_resampler_strerror(err));
+                    return SWITCH_STATUS_FALSE;
+                }
+                tech_pvt->inject_sample_rate = sample_rate;
+            }
+
+            const spx_int16_t *in = reinterpret_cast<const spx_int16_t *>(input_ptr);
+            spx_uint32_t in_len = static_cast<spx_uint32_t>(input_len / sizeof(int16_t));
+            spx_uint32_t out_len = static_cast<spx_uint32_t>((static_cast<uint64_t>(in_len) * out_rate) / sample_rate + 16);
+            resampled_samples.resize(out_len);
+
+            speex_resampler_process_int(tech_pvt->inject_resampler,
+                                        0,
+                                        in,
+                                        &in_len,
+                                        reinterpret_cast<spx_int16_t *>(resampled_samples.data()),
+                                        &out_len);
+            resampled_samples.resize(out_len);
+            input_ptr = reinterpret_cast<const uint8_t *>(resampled_samples.data());
+            input_len = resampled_samples.size() * sizeof(int16_t);
+        }
+
+        switch_mutex_lock(tech_pvt->inject_mutex);
+        const switch_size_t free_bytes = switch_buffer_freespace(tech_pvt->inject_buffer);
+        const switch_size_t bytes_to_write = static_cast<switch_size_t>((input_len <= free_bytes) ? input_len : free_bytes);
+
+        if (bytes_to_write > 0) {
+            switch_buffer_write(tech_pvt->inject_buffer, input_ptr, bytes_to_write);
+        }
+        switch_mutex_unlock(tech_pvt->inject_mutex);
+
+        if (bytes_to_write == 0) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                "(%s) inject_audio_data: inject buffer full, dropping %zu bytes\n",
+                tech_pvt->sessionId, input_len);
+            return SWITCH_STATUS_FALSE;
+        }
         
-        // TODO: Implement actual audio injection logic
-        DEBUG_LOG(DEBUG_LEVEL_DEBUG, session, "inject_audio_data: Received %zu bytes at %d Hz", 
-                 data_len, sample_rate);
+        DEBUG_LOG(DEBUG_LEVEL_DEBUG, session, "inject_audio_data: queued %zu/%zu bytes at %d Hz", 
+                 static_cast<size_t>(bytes_to_write), input_len, sample_rate);
         
         return SWITCH_STATUS_SUCCESS;
     }
@@ -1466,8 +1596,44 @@ extern "C" {
         if (!session || !frame) {
             return SWITCH_STATUS_FALSE;
         }
+
+        switch_channel_t *channel = switch_core_session_get_channel(session);
+        if (!channel) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        auto *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
+        if (!bug) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        auto *tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt || !tech_pvt->inject_audio_enabled || !tech_pvt->inject_buffer || !tech_pvt->inject_mutex) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        switch_mutex_lock(tech_pvt->inject_mutex);
+        const switch_size_t in_use = switch_buffer_inuse(tech_pvt->inject_buffer);
+        if (in_use == 0) {
+            switch_mutex_unlock(tech_pvt->inject_mutex);
+            return SWITCH_STATUS_FALSE;
+        }
+
+        const switch_size_t to_read = static_cast<switch_size_t>((frame->datalen <= in_use) ? frame->datalen : in_use);
+        const switch_size_t read_bytes = switch_buffer_read(tech_pvt->inject_buffer,
+                                                             reinterpret_cast<uint8_t *>(frame->data),
+                                                             to_read);
+        switch_mutex_unlock(tech_pvt->inject_mutex);
+
+        if (read_bytes == 0) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        // Reemplaza audio saliente; si falta audio inyectado completa con silencio.
+        if (read_bytes < frame->datalen) {
+            memset(reinterpret_cast<uint8_t *>(frame->data) + read_bytes, 0, frame->datalen - read_bytes);
+        }
         
-        // TODO: Implement actual audio processing logic
         return SWITCH_STATUS_SUCCESS;
     }
 }
