@@ -75,6 +75,8 @@ namespace {
 // Forward declarations for functions used in cleanup
 extern "C" {
     void decrement_active_channels();
+    switch_status_t inject_audio_data(switch_core_session_t *session, const uint8_t* audio_data,
+                                      size_t data_len, int sample_rate, int channels);
 }
 
 class AudioStreamer {
