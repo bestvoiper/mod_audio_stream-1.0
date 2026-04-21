@@ -1597,9 +1597,10 @@ extern "C" {
         }
 
         int out_rate = tech_pvt->sampling > 0 ? tech_pvt->sampling : sample_rate;
-        const switch_codec_implementation_t *write_impl = switch_core_session_get_write_impl(session);
-        if (write_impl && write_impl->actual_samples_per_second > 0) {
-            out_rate = static_cast<int>(write_impl->actual_samples_per_second);
+        switch_codec_implementation_t write_impl = {};
+        if (switch_core_session_get_write_impl(session, &write_impl) == SWITCH_STATUS_SUCCESS &&
+            write_impl.actual_samples_per_second > 0) {
+            out_rate = static_cast<int>(write_impl.actual_samples_per_second);
         }
         if (sample_rate != out_rate) {
             int err = 0;
