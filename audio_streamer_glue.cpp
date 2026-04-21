@@ -71,6 +71,67 @@ namespace {
     // Forward declarations for cleanup functions
     void finish(private_t* tech_pvt);
     void destroy_tech_pvt(private_t* tech_pvt);
+
+    static inline uint8_t linear_to_ulaw(int16_t pcm_val) {
+        static const int16_t seg_end[8] = {0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF, 0x3FFF, 0x7FFF};
+        int16_t mask;
+        int16_t seg;
+        uint8_t uval;
+
+        if (pcm_val < 0) {
+            pcm_val = static_cast<int16_t>(0x84 - pcm_val);
+            mask = 0x7F;
+        } else {
+            pcm_val = static_cast<int16_t>(0x84 + pcm_val);
+            mask = 0xFF;
+        }
+
+        seg = 0;
+        while (seg < 8 && pcm_val > seg_end[seg]) {
+            seg++;
+        }
+
+        if (seg >= 8) {
+            return static_cast<uint8_t>(0x7F ^ mask);
+        }
+
+        uval = static_cast<uint8_t>((seg << 4) | ((pcm_val >> (seg + 3)) & 0xF));
+        return static_cast<uint8_t>(uval ^ mask);
+    }
+
+    static inline uint8_t linear_to_alaw(int16_t pcm_val) {
+        int16_t mask;
+        int16_t seg;
+        uint8_t aval;
+
+        if (pcm_val >= 0) {
+            mask = 0xD5;
+        } else {
+            mask = 0x55;
+            pcm_val = static_cast<int16_t>(-pcm_val - 1);
+            if (pcm_val < 0) {
+                pcm_val = 32767;
+            }
+        }
+
+        if (pcm_val > 32635) {
+            pcm_val = 32635;
+        }
+
+        if (pcm_val >= 256) {
+            static const int16_t seg_end[8] = {0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF, 0x3FFF, 0x7FFF, 0x7FFF};
+            seg = 0;
+            while (seg < 8 && pcm_val > seg_end[seg]) {
+                seg++;
+            }
+            aval = static_cast<uint8_t>(seg << 4);
+            aval |= static_cast<uint8_t>((pcm_val >> (seg + 3)) & 0x0F);
+        } else {
+            aval = static_cast<uint8_t>(pcm_val >> 4);
+        }
+
+        return static_cast<uint8_t>(aval ^ mask);
+    }
 }
 
 // Forward declarations for functions used in cleanup
@@ -1535,7 +1596,11 @@ extern "C" {
             channels = 1;
         }
 
-        const int out_rate = tech_pvt->sampling > 0 ? tech_pvt->sampling : sample_rate;
+        int out_rate = tech_pvt->sampling > 0 ? tech_pvt->sampling : sample_rate;
+        const switch_codec_implementation_t *write_impl = switch_core_session_get_write_impl(session);
+        if (write_impl && write_impl->actual_samples_per_second > 0) {
+            out_rate = static_cast<int>(write_impl->actual_samples_per_second);
+        }
         if (sample_rate != out_rate) {
             int err = 0;
             if (!tech_pvt->inject_resampler || tech_pvt->inject_sample_rate != sample_rate) {
@@ -1647,19 +1712,57 @@ extern "C" {
             return SWITCH_STATUS_FALSE;
         }
 
-        const switch_size_t to_read = static_cast<switch_size_t>((frame->datalen <= in_use) ? frame->datalen : in_use);
-        const switch_size_t read_bytes = switch_buffer_read(tech_pvt->inject_buffer,
-                                                             reinterpret_cast<uint8_t *>(frame->data),
-                                                             to_read);
-        switch_mutex_unlock(tech_pvt->inject_mutex);
-
-        if (read_bytes == 0) {
-            return SWITCH_STATUS_FALSE;
+        const char *codec_name = nullptr;
+        if (frame->codec && frame->codec->implementation && frame->codec->implementation->iananame) {
+            codec_name = frame->codec->implementation->iananame;
         }
 
-        // Reemplaza audio saliente; si falta audio inyectado completa con silencio.
-        if (read_bytes < frame->datalen) {
-            memset(reinterpret_cast<uint8_t *>(frame->data) + read_bytes, 0, frame->datalen - read_bytes);
+        const bool is_pcmu = codec_name && strcasecmp(codec_name, "PCMU") == 0;
+        const bool is_pcma = codec_name && strcasecmp(codec_name, "PCMA") == 0;
+
+        if (is_pcmu || is_pcma) {
+            const switch_size_t needed_pcm16 = static_cast<switch_size_t>(frame->samples * sizeof(int16_t));
+            const switch_size_t to_read = (needed_pcm16 <= in_use) ? needed_pcm16 : in_use;
+
+            std::vector<int16_t> pcm_buf(frame->samples, 0);
+            const switch_size_t read_bytes = switch_buffer_read(
+                tech_pvt->inject_buffer,
+                reinterpret_cast<uint8_t *>(pcm_buf.data()),
+                to_read);
+            switch_mutex_unlock(tech_pvt->inject_mutex);
+
+            if (read_bytes == 0) {
+                return SWITCH_STATUS_FALSE;
+            }
+
+            const switch_size_t got_samples = read_bytes / sizeof(int16_t);
+            uint8_t *out = reinterpret_cast<uint8_t *>(frame->data);
+            const switch_size_t out_samples = static_cast<switch_size_t>(frame->samples);
+            const switch_size_t encode_samples = (got_samples <= out_samples) ? got_samples : out_samples;
+
+            for (switch_size_t i = 0; i < encode_samples; ++i) {
+                out[i] = is_pcmu ? linear_to_ulaw(pcm_buf[i]) : linear_to_alaw(pcm_buf[i]);
+            }
+
+            const uint8_t silence_code = is_pcmu ? 0xFF : 0xD5;
+            if (encode_samples < out_samples) {
+                memset(out + encode_samples, silence_code, out_samples - encode_samples);
+            }
+        } else {
+            const switch_size_t to_read = static_cast<switch_size_t>((frame->datalen <= in_use) ? frame->datalen : in_use);
+            const switch_size_t read_bytes = switch_buffer_read(tech_pvt->inject_buffer,
+                                                                 reinterpret_cast<uint8_t *>(frame->data),
+                                                                 to_read);
+            switch_mutex_unlock(tech_pvt->inject_mutex);
+
+            if (read_bytes == 0) {
+                return SWITCH_STATUS_FALSE;
+            }
+
+            // Reemplaza audio saliente; si falta audio inyectado completa con silencio.
+            if (read_bytes < frame->datalen) {
+                memset(reinterpret_cast<uint8_t *>(frame->data) + read_bytes, 0, frame->datalen - read_bytes);
+            }
         }
         
         return SWITCH_STATUS_SUCCESS;
