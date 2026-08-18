@@ -12,10 +12,17 @@ switch_status_t is_valid_utf8(const char *str);
 switch_status_t stream_session_send_text(switch_core_session_t *session, char* text);
 switch_status_t stream_session_pauseresume(switch_core_session_t *session, int pause);
 switch_status_t stream_session_init(switch_core_session_t *session, responseHandler_t responseHandler,
-    uint32_t samples_per_second, char *wsUri, int sampling, int channels, char* metadata, void **ppUserData);
+    uint32_t samples_per_second, char *wsUri, int sampling, int channels, char* metadata,
+    audio_mix_mode_t mix_mode, void **ppUserData);
 void stream_session_start(void *pUserData);
 switch_bool_t stream_frame(switch_media_bug_t *bug);
 switch_status_t stream_session_cleanup(switch_core_session_t *session, char* text, int channelIsClosing);
+
+// Audio injection functions
+switch_status_t inject_audio_data(switch_core_session_t *session, const uint8_t* audio_data, 
+                                 size_t data_len, int sample_rate, int channels);
+switch_status_t enable_audio_injection(switch_core_session_t *session, int enable);
+switch_status_t process_injected_audio(switch_core_session_t *session, switch_frame_t *frame);
 
 // Module lifecycle functions
 switch_status_t init_audio_stream_module(void);

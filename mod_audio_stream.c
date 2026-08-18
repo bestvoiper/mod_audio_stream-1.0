@@ -52,17 +52,33 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
             return stream_frame(bug);
             break;
 
-        case SWITCH_ABC_TYPE_WRITE:
-            /* write-only capture (far-end / early media on A-leg). Mixed/stereo
-               already consume both buffers from the READ callback. */
-            if (tech_pvt->close_requested) {
-                return SWITCH_FALSE;
-            }
-            if (!switch_core_media_bug_test_flag(bug, SMBF_READ_STREAM)) {
-                return stream_frame(bug);
+        case SWITCH_ABC_TYPE_WRITE_REPLACE:
+            // Preferred injection path: replace outbound audio frame.
+            if (tech_pvt && !tech_pvt->close_requested && tech_pvt->inject_audio_enabled) {
+                switch_frame_t *frame = switch_core_media_bug_get_write_replace_frame(bug);
+                if (!frame) {
+                    frame = switch_core_media_bug_get_native_write_frame(bug);
+                }
+                if (frame && process_injected_audio(session, frame) == SWITCH_STATUS_SUCCESS) {
+                    switch_core_media_bug_set_write_replace_frame(bug, frame);
+                }
             }
             break;
 
+        case SWITCH_ABC_TYPE_WRITE:
+            /* write-only capture (far-end / early media on A-leg). Mixed/stereo
+               already consume both buffers from the READ callback. */
+            if (tech_pvt && !tech_pvt->close_requested && tech_pvt->inject_audio_enabled) {
+                switch_frame_t *frame = switch_core_media_bug_get_native_write_frame(bug);
+                if (frame) {
+                    process_injected_audio(session, frame);
+                }
+            }
+            if (tech_pvt && !tech_pvt->close_requested &&
+                !switch_core_media_bug_test_flag(bug, SMBF_READ_STREAM)) {
+                return stream_frame(bug);
+            }
+            break;
         default:
             break;
     }
@@ -74,7 +90,8 @@ static switch_status_t start_capture(switch_core_session_t *session,
                                      switch_media_bug_flag_t flags,
                                      char* wsUri,
                                      int sampling,
-                                     char* metadata)
+                                     char* metadata,
+                                     audio_mix_mode_t mix_mode)
 {
     switch_channel_t *channel = switch_core_session_get_channel(session);
     switch_media_bug_t *bug;
@@ -153,7 +170,7 @@ static switch_status_t start_capture(switch_core_session_t *session,
 
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "calling stream_session_init.\n");
         if (SWITCH_STATUS_FALSE == stream_session_init(session, responseHandler, native_rate,
-                                                     wsUri, sampling, channels, metadata, &pUserData)) {
+                                                     wsUri, sampling, channels, metadata, mix_mode, &pUserData)) {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing mod_audio_stream session.\n");
             return SWITCH_STATUS_FALSE;
         }
@@ -212,7 +229,17 @@ static switch_status_t send_text(switch_core_session_t *session, char* text) {
     return status;
 }
 
-#define STREAM_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo | write] [8000 | 16000] [metadata]"
+static switch_status_t do_enable_injection(switch_core_session_t *session, int enable)
+{
+    switch_status_t status = SWITCH_STATUS_SUCCESS;
+
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: %s audio injection\n", enable ? "enabling" : "disabling");
+    status = enable_audio_injection(session, enable);
+
+    return status;
+}
+
+#define STREAM_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | enable_inject | disable_inject | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo | write | enhanced_mixed] [8000 | 16000] [metadata]"
 SWITCH_STANDARD_API(stream_function)
 {
     char *mycmd = NULL, *argv[6] = { 0 };
@@ -259,11 +286,16 @@ SWITCH_STANDARD_API(stream_function)
                     goto done;
                 }
                 status = send_text(lsession, argv[2]);
+            } else if (!strcasecmp(argv[1], "enable_inject")) {
+                status = do_enable_injection(lsession, 1);
+            } else if (!strcasecmp(argv[1], "disable_inject")) {
+                status = do_enable_injection(lsession, 0);
             } else if (!strcasecmp(argv[1], "start")) {
                 //switch_channel_t *channel = switch_core_session_get_channel(lsession);
                 char wsUri[MAX_WS_URI];
                 int sampling = 8000;
-                switch_media_bug_flag_t flags = SMBF_READ_PING | SMBF_NO_PAUSE;
+                switch_media_bug_flag_t flags = SMBF_READ_PING | SMBF_NO_PAUSE | SMBF_WRITE_REPLACE;
+                audio_mix_mode_t mix_mode = MIX_MODE_MONO;
                 char *metadata = argc > 5 ? argv[5] : NULL;
                 if(metadata && (is_valid_utf8(argv[2]) != SWITCH_STATUS_SUCCESS)) {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
@@ -273,19 +305,24 @@ SWITCH_STANDARD_API(stream_function)
                 }
                 if (0 == strcmp(argv[3], "mixed")) {
                     flags |= SMBF_READ_STREAM | SMBF_WRITE_STREAM;
+                    mix_mode = MIX_MODE_MIXED;
                 } else if (0 == strcmp(argv[3], "stereo")) {
                     flags |= SMBF_READ_STREAM | SMBF_WRITE_STREAM;
                     flags |= SMBF_STEREO;
+                    mix_mode = MIX_MODE_STEREO;
                 } else if (0 == strcmp(argv[3], "write")) {
                     /* Far-end only: A-leg write path (early media / voicemail greeting). */
                     flags |= SMBF_WRITE_STREAM;
+                } else if (0 == strcmp(argv[3], "enhanced_mixed")) {
+                    flags |= SMBF_READ_STREAM | SMBF_WRITE_STREAM;
+                    mix_mode = MIX_MODE_ENHANCED_MIXED;
                 } else if (0 == strcmp(argv[3], "mono")) {
                     /* READ_STREAM tap (does not intercept the codec). READ_REPLACE
                        muted both the FS recording and the stream on this path. */
                     flags |= SMBF_READ_STREAM;
                 } else {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                      "invalid mix type: %s, must be mono, mixed, stereo, or write\n", argv[3]);
+                                      "invalid mix type: %s, must be mono, mixed, stereo, write, or enhanced_mixed\n", argv[3]);
                     switch_core_session_rwunlock(lsession);
                     goto done;
                 }
@@ -305,7 +342,7 @@ SWITCH_STANDARD_API(stream_function)
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
                                       "invalid sample rate: %s\n", argv[4]);
                 } else {
-                    status = start_capture(lsession, flags, wsUri, sampling, metadata);
+                    status = start_capture(lsession, flags, wsUri, sampling, metadata, mix_mode);
                 }
             } else {
                 switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
@@ -361,6 +398,8 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_stream_load)
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid pause");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid resume");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid send_text");
+    switch_console_set_complete("add uuid_audio_stream ::console::list_uuid enable_inject");
+    switch_console_set_complete("add uuid_audio_stream ::console::list_uuid disable_inject");
 
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_stream API successfully loaded\n");
 

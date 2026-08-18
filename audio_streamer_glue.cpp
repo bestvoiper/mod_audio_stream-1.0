@@ -23,11 +23,13 @@
 #include <unordered_set>
 #include <atomic>
 #include <mutex>
+#include <vector>
 #include "base64.h"
 
 #define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
 /* If Vosk/proxy stall, keep ~2.5s instead of dropping to 400ms (that skipped late greetings). */
 #define STREAM_WS_BACKLOG_MS 2500
+#define INJECT_BUFFER_MULTIPLIER 100 /* keep about 2 seconds at 16k/20ms chunks when rtp_packets=1 */
 
 // Debug level constants
 #define DEBUG_LEVEL_NONE     0
@@ -73,11 +75,77 @@ static std::atomic<int> g_debug_level{DEBUG_LEVEL_WARNING}; // Default to WARNIN
 
 namespace {
     extern switch_bool_t filter_json_string(switch_core_session_t *session, const char* message);
+    // Forward declarations for cleanup functions
+    void finish(private_t* tech_pvt);
+    void destroy_tech_pvt(private_t* tech_pvt);
+
+    static inline uint8_t linear_to_ulaw(int16_t pcm_val) {
+        static const int16_t seg_end[8] = {0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF, 0x3FFF, 0x7FFF};
+        int16_t mask;
+        int16_t seg;
+        uint8_t uval;
+
+        if (pcm_val < 0) {
+            pcm_val = static_cast<int16_t>(0x84 - pcm_val);
+            mask = 0x7F;
+        } else {
+            pcm_val = static_cast<int16_t>(0x84 + pcm_val);
+            mask = 0xFF;
+        }
+
+        seg = 0;
+        while (seg < 8 && pcm_val > seg_end[seg]) {
+            seg++;
+        }
+
+        if (seg >= 8) {
+            return static_cast<uint8_t>(0x7F ^ mask);
+        }
+
+        uval = static_cast<uint8_t>((seg << 4) | ((pcm_val >> (seg + 3)) & 0xF));
+        return static_cast<uint8_t>(uval ^ mask);
+    }
+
+    static inline uint8_t linear_to_alaw(int16_t pcm_val) {
+        int16_t mask;
+        int16_t seg;
+        uint8_t aval;
+
+        if (pcm_val >= 0) {
+            mask = 0xD5;
+        } else {
+            mask = 0x55;
+            pcm_val = static_cast<int16_t>(-pcm_val - 1);
+            if (pcm_val < 0) {
+                pcm_val = 32767;
+            }
+        }
+
+        if (pcm_val > 32635) {
+            pcm_val = 32635;
+        }
+
+        if (pcm_val >= 256) {
+            static const int16_t seg_end[8] = {0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF, 0x3FFF, 0x7FFF, 0x7FFF};
+            seg = 0;
+            while (seg < 8 && pcm_val > seg_end[seg]) {
+                seg++;
+            }
+            aval = static_cast<uint8_t>(seg << 4);
+            aval |= static_cast<uint8_t>((pcm_val >> (seg + 3)) & 0x0F);
+        } else {
+            aval = static_cast<uint8_t>(pcm_val >> 4);
+        }
+
+        return static_cast<uint8_t>(aval ^ mask);
+    }
 }
 
 // Forward declarations for functions used in cleanup
 extern "C" {
     void decrement_active_channels();
+    switch_status_t inject_audio_data(switch_core_session_t *session, const uint8_t* audio_data,
+                                      size_t data_len, int sample_rate, int channels);
 }
 
 class AudioStreamer {
@@ -260,12 +328,55 @@ public:
     }
 
     inline void media_bug_close(switch_core_session_t *session) {
-        auto *bug = get_media_bug(session);
-        if(bug) {
-            auto* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
-            tech_pvt->close_requested = 1;
-            switch_core_media_bug_close(&bug, SWITCH_FALSE);
+        switch_channel_t *channel = switch_core_session_get_channel(session);
+        if (!channel) {
+            return;
         }
+        
+        auto *bug = (switch_media_bug_t *) switch_channel_get_private(channel, MY_BUG_NAME);
+        if(!bug) {
+            return;
+        }
+        
+        auto* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt) {
+            switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
+            switch_core_media_bug_close(&bug, SWITCH_FALSE);
+            return;
+        }
+        
+        // Prevent multiple cleanup calls
+        if (tech_pvt->close_requested) {
+            return;
+        }
+        tech_pvt->close_requested = 1;
+        
+        // Clear private data FIRST to prevent "bug already attached" errors
+        switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
+        
+        // Do the actual cleanup
+        if (tech_pvt->mutex) {
+            switch_mutex_lock(tech_pvt->mutex);
+        }
+        
+        auto* audioStreamer = (AudioStreamer *) tech_pvt->pAudioStreamer;
+        if (audioStreamer) {
+            audioStreamer->deleteFiles();
+            finish(tech_pvt);
+        }
+        
+        if (tech_pvt->mutex) {
+            switch_mutex_unlock(tech_pvt->mutex);
+        }
+        
+        // Close the bug - SWITCH_ABC_TYPE_CLOSE callback will find no bug and return early
+        switch_core_media_bug_close(&bug, SWITCH_FALSE);
+        
+        // Final cleanup
+        destroy_tech_pvt(tech_pvt);
+        
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, 
+            "media_bug_close: cleanup completed\n");
     }
 
     inline void send_initial_metadata(switch_core_session_t *session) {
@@ -326,20 +437,16 @@ public:
                 cJSON* jsonAudio = cJSON_DetachItemFromObject(jsonData, "audioData");
                 const char* jsAudioDataType = cJSON_GetObjectCstr(jsonData, "audioDataType");
                 std::string fileType;
-                int sampleRate;
-                if (0 == strcmp(jsAudioDataType, "raw")) {
+                int sampleRate = 0;
+                int channels = 1;
+                if (!jsAudioDataType) {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                      "(%s) processMessage - missing audioDataType\n", m_sessionId.c_str());
+                } else if (0 == strcmp(jsAudioDataType, "raw")) {
                     cJSON* jsonSampleRate = cJSON_GetObjectItem(jsonData, "sampleRate");
                     sampleRate = jsonSampleRate && jsonSampleRate->valueint ? jsonSampleRate->valueint : 0;
-                    std::unordered_map<int, const char*> sampleRateMap = {
-                            {8000, ".r8"},
-                            {16000, ".r16"},
-                            {24000, ".r24"},
-                            {32000, ".r32"},
-                            {48000, ".r48"},
-                            {64000, ".r64"}
-                    };
-                    auto it = sampleRateMap.find(sampleRate);
-                    fileType = (it != sampleRateMap.end()) ? it->second : "";
+                    cJSON* jsonChannels = cJSON_GetObjectItem(jsonData, "channels");
+                    channels = jsonChannels && jsonChannels->valueint ? jsonChannels->valueint : 1;
                 } else if (0 == strcmp(jsAudioDataType, "wav")) {
                     fileType = ".wav";
                 } else if (0 == strcmp(jsAudioDataType, "mp3")) {
@@ -351,8 +458,7 @@ public:
                                       m_sessionId.c_str(), jsAudioDataType);
                 }
 
-                if(jsonAudio && jsonAudio->valuestring != nullptr && !fileType.empty()) {
-                    char filePath[256];
+                if(jsonAudio && jsonAudio->valuestring != nullptr) {
                     std::string rawAudio;
                     try {
                         rawAudio = base64_decode(jsonAudio->valuestring);
@@ -362,18 +468,51 @@ public:
                         cJSON_Delete(jsonAudio); cJSON_Delete(json);
                         return status;
                     }
-                    switch_snprintf(filePath, 256, "%s%s%s_%d.tmp%s", SWITCH_GLOBAL_dirs.temp_dir,
-                                    SWITCH_PATH_SEPARATOR, m_sessionId.c_str(), m_playFile++, fileType.c_str());
-                    std::ofstream fstream(filePath, std::ofstream::binary);
-                    if (fstream.is_open()) {
-                        fstream << rawAudio;
-                        fstream.close();
-                        m_Files.insert(filePath);
-                        jsonFile = cJSON_CreateString(filePath);
-                        cJSON_AddItemToObject(jsonData, "file", jsonFile);
+
+                    if (jsAudioDataType && 0 == strcmp(jsAudioDataType, "raw")) {
+                        if (sampleRate <= 0) {
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                              "(%s) processMessage - invalid sampleRate for raw audio\n",
+                                              m_sessionId.c_str());
+                        } else {
+                            if (inject_audio_data(session,
+                                                  reinterpret_cast<const uint8_t *>(rawAudio.data()),
+                                                  rawAudio.size(),
+                                                  sampleRate,
+                                                  channels) == SWITCH_STATUS_SUCCESS) {
+                                status = SWITCH_TRUE;
+                            } else {
+                                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                                  "(%s) processMessage - inject_audio_data failed\n",
+                                                  m_sessionId.c_str());
+                            }
+                        }
                     } else {
-                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "(%s) processMessage - failed to create file: %s\n",
-                                          m_sessionId.c_str(), filePath);
+                        if (fileType.empty()) {
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                              "(%s) processMessage - unsupported or invalid audioDataType\n",
+                                              m_sessionId.c_str());
+                            if (jsonAudio)
+                                cJSON_Delete(jsonAudio);
+                            cJSON_Delete(json);
+                            return status;
+                        }
+
+                        char filePath[256];
+                        switch_snprintf(filePath, 256, "%s%s%s_%d.tmp%s", SWITCH_GLOBAL_dirs.temp_dir,
+                                        SWITCH_PATH_SEPARATOR, m_sessionId.c_str(), m_playFile++, fileType.c_str());
+                        std::ofstream fstream(filePath, std::ofstream::binary);
+                        if (fstream.is_open()) {
+                            fstream << rawAudio;
+                            fstream.close();
+                            m_Files.insert(filePath);
+                            jsonFile = cJSON_CreateString(filePath);
+                            cJSON_AddItemToObject(jsonData, "file", jsonFile);
+                        } else {
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                                              "(%s) processMessage - failed to create file: %s\n",
+                                              m_sessionId.c_str(), filePath);
+                        }
                     }
                 }
 
@@ -717,7 +856,7 @@ namespace {
     switch_status_t stream_data_init(private_t *tech_pvt, switch_core_session_t *session, char *wsUri,
                                      uint32_t sampling, int desiredSampling, int channels, char *metadata, responseHandler_t responseHandler,
                                      int deflate, int heart_beat, bool globalTrace, bool suppressLog, int rtp_packets, const char* extra_headers,
-                                     bool no_reconnect)
+                                     bool no_reconnect, audio_mix_mode_t mix_mode)
     {
         int err; //speex
 
@@ -732,6 +871,7 @@ namespace {
         tech_pvt->rtp_packets = rtp_packets;
         tech_pvt->channels = channels;
         tech_pvt->audio_paused = 0;
+        tech_pvt->mix_mode = mix_mode;
 
         if (metadata) strncpy(tech_pvt->initialMetadata, metadata, MAX_METADATA_LEN);
 
@@ -786,7 +926,35 @@ namespace {
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) no resampling needed for this call\n", tech_pvt->sessionId);
         }
 
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_data_init\n", tech_pvt->sessionId);
+        // Initialize enhanced mixing buffers if needed
+        if (mix_mode == MIX_MODE_ENHANCED_MIXED) {
+            // Create separate buffers for read and write audio for enhanced mixing
+            if (switch_buffer_create(pool, &tech_pvt->read_buffer, buflen * 2) != SWITCH_STATUS_SUCCESS) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                    "%s: Error creating read buffer for enhanced mixing.\n", tech_pvt->sessionId);
+                return SWITCH_STATUS_FALSE;
+            }
+            if (switch_buffer_create(pool, &tech_pvt->write_buffer, buflen * 2) != SWITCH_STATUS_SUCCESS) {
+                switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                    "%s: Error creating write buffer for enhanced mixing.\n", tech_pvt->sessionId);
+                return SWITCH_STATUS_FALSE;
+            }
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, 
+                "(%s) Enhanced mixing mode initialized with separate read/write buffers\n", tech_pvt->sessionId);
+        }
+
+        // Initialize audio injection resources.
+        if (switch_buffer_create(pool, &tech_pvt->inject_buffer, buflen * INJECT_BUFFER_MULTIPLIER) != SWITCH_STATUS_SUCCESS) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "%s: Error creating injection buffer.\n", tech_pvt->sessionId);
+            return SWITCH_STATUS_FALSE;
+        }
+        switch_mutex_init(&tech_pvt->inject_mutex, SWITCH_MUTEX_NESTED, pool);
+        tech_pvt->inject_audio_enabled = 0;
+        tech_pvt->inject_sample_rate = desiredSampling;
+        tech_pvt->inject_channels = 1;
+
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "(%s) stream_data_init with mix_mode=%d\n", tech_pvt->sessionId, mix_mode);
 
         return SWITCH_STATUS_SUCCESS;
     }
@@ -816,6 +984,12 @@ namespace {
             speex_resampler_destroy(tech_pvt->resampler);
             tech_pvt->resampler = nullptr;
             DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "Destroyed resampler for session %s", tech_pvt->sessionId);
+        }
+
+        if (tech_pvt->inject_resampler) {
+            speex_resampler_destroy(tech_pvt->inject_resampler);
+            tech_pvt->inject_resampler = nullptr;
+            DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "Destroyed inject resampler for session %s", tech_pvt->sessionId);
         }
         
         // Clean up AudioStreamer
@@ -860,6 +1034,15 @@ namespace {
         std::shared_ptr<AudioStreamer> aStreamer;
         aStreamer.reset((AudioStreamer *)tech_pvt->pAudioStreamer);
         tech_pvt->pAudioStreamer = nullptr;
+
+        // Immediately remove session from g_active_sessions to prevent race condition
+        // when a new session with the same UUID is started before this thread completes
+        {
+            std::lock_guard<std::mutex> lock(g_channel_mutex);
+            g_active_sessions.erase(tech_pvt->sessionId);
+            DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "Removed session %s from active sessions in finish(). Remaining: %zu", 
+                           tech_pvt->sessionId, g_active_sessions.size());
+        }
 
         std::thread t([aStreamer]{
             aStreamer->disconnect();
@@ -1133,6 +1316,7 @@ extern "C" {
                                         int sampling,
                                         int channels,
                                         char* metadata,
+                                        audio_mix_mode_t mix_mode,
                                         void **ppUserData)
     {
         if (!session || !wsUri || !ppUserData) {
@@ -1230,7 +1414,7 @@ extern "C" {
         // Try to initialize stream data
         switch_status_t init_result = stream_data_init(tech_pvt, session, wsUri, samples_per_second, sampling, 
                                                       channels, metadata, responseHandler, deflate, heart_beat,
-                                                      globalTrace, suppressLog, rtp_packets, extra_headers, no_reconnect);
+                                                      globalTrace, suppressLog, rtp_packets, extra_headers, no_reconnect, mix_mode);
         
         if (init_result != SWITCH_STATUS_SUCCESS) {
             DEBUG_LOG(DEBUG_LEVEL_ERROR, session, "stream_data_init failed with status %d", init_result);
@@ -1540,9 +1724,17 @@ extern "C" {
             return SWITCH_STATUS_FALSE;
         }
 
+        // IMPORTANT: Clear private data FIRST to prevent "bug already attached" errors
+        // on rapid stop/start sequences
+        switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
+
         auto* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
         if (!tech_pvt) {
             DEBUG_LOG(DEBUG_LEVEL_ERROR, session, "No tech_pvt found");
+            // Remove the bug even without tech_pvt
+            if (!channelIsClosing) {
+                switch_core_media_bug_remove(session, &bug);
+            }
             return SWITCH_STATUS_FALSE;
         }
 
@@ -1556,6 +1748,10 @@ extern "C" {
         // Prevent multiple cleanup calls
         if (tech_pvt->close_requested) {
             DEBUG_LOG(DEBUG_LEVEL_DEBUG, session, "Cleanup already in progress for session %s", sessionId);
+            // Still need to remove the bug if not closing
+            if (!channelIsClosing) {
+                switch_core_media_bug_remove(session, &bug);
+            }
             return SWITCH_STATUS_SUCCESS;
         }
         
@@ -1566,8 +1762,7 @@ extern "C" {
             switch_mutex_lock(tech_pvt->mutex);
         }
 
-        switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
-        
+        // Remove the bug AFTER setting close_requested to avoid race in callback
         if (!channelIsClosing) {
             switch_core_media_bug_remove(session, &bug);
         }
@@ -1590,5 +1785,259 @@ extern "C" {
         switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%s) stream_session_cleanup: connection closed\n", sessionId);
         return SWITCH_STATUS_SUCCESS;
     }
-}
 
+    // Audio injection functions
+    switch_status_t enable_audio_injection(switch_core_session_t *session, int enable) {
+        if (!session) {
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        switch_channel_t *channel = switch_core_session_get_channel(session);
+        if (!channel) {
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        auto *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
+        if (!bug) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING, 
+                "enable_audio_injection: No active stream bug found\n");
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        auto *tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt) {
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        tech_pvt->inject_audio_enabled = enable;
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, 
+            "(%s) Audio injection %s\n", tech_pvt->sessionId, enable ? "enabled" : "disabled");
+        
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    switch_status_t inject_audio_data(switch_core_session_t *session, const uint8_t* audio_data, 
+                                      size_t data_len, int sample_rate, int channels) {
+        if (!session || !audio_data || data_len == 0) {
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        switch_channel_t *channel = switch_core_session_get_channel(session);
+        if (!channel) {
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        auto *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
+        if (!bug) {
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        auto *tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt || !tech_pvt->inject_audio_enabled) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        if (!tech_pvt->inject_buffer || !tech_pvt->inject_mutex) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                "(%s) inject_audio_data: injection not initialized\n", tech_pvt->sessionId);
+            return SWITCH_STATUS_FALSE;
+        }
+
+        if (sample_rate <= 0) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        const uint8_t* input_ptr = audio_data;
+        size_t input_len = data_len;
+        std::vector<int16_t> mono_samples;
+        std::vector<int16_t> resampled_samples;
+
+        if (channels > 1) {
+            const size_t frames = data_len / (sizeof(int16_t) * channels);
+            mono_samples.resize(frames);
+            const int16_t *in = reinterpret_cast<const int16_t *>(audio_data);
+            for (size_t i = 0; i < frames; ++i) {
+                int32_t acc = 0;
+                for (int c = 0; c < channels; ++c) {
+                    acc += in[i * channels + c];
+                }
+                mono_samples[i] = static_cast<int16_t>(acc / channels);
+            }
+            input_ptr = reinterpret_cast<const uint8_t *>(mono_samples.data());
+            input_len = mono_samples.size() * sizeof(int16_t);
+            channels = 1;
+        }
+
+        int out_rate = tech_pvt->sampling > 0 ? tech_pvt->sampling : sample_rate;
+        switch_codec_implementation_t write_impl = {};
+        if (switch_core_session_get_write_impl(session, &write_impl) == SWITCH_STATUS_SUCCESS &&
+            write_impl.actual_samples_per_second > 0) {
+            out_rate = static_cast<int>(write_impl.actual_samples_per_second);
+        }
+        if (sample_rate != out_rate) {
+            int err = 0;
+            if (!tech_pvt->inject_resampler || tech_pvt->inject_sample_rate != sample_rate) {
+                if (tech_pvt->inject_resampler) {
+                    speex_resampler_destroy(tech_pvt->inject_resampler);
+                    tech_pvt->inject_resampler = nullptr;
+                }
+                tech_pvt->inject_resampler = speex_resampler_init(1,
+                                                                   static_cast<spx_uint32_t>(sample_rate),
+                                                                   static_cast<spx_uint32_t>(out_rate),
+                                                                   SWITCH_RESAMPLE_QUALITY,
+                                                                   &err);
+                if (err != 0 || !tech_pvt->inject_resampler) {
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                        "(%s) inject_audio_data: failed to init inject resampler: %s\n",
+                        tech_pvt->sessionId, speex_resampler_strerror(err));
+                    return SWITCH_STATUS_FALSE;
+                }
+                tech_pvt->inject_sample_rate = sample_rate;
+            }
+
+            const spx_int16_t *in = reinterpret_cast<const spx_int16_t *>(input_ptr);
+            spx_uint32_t in_len = static_cast<spx_uint32_t>(input_len / sizeof(int16_t));
+            spx_uint32_t out_len = static_cast<spx_uint32_t>((static_cast<uint64_t>(in_len) * out_rate) / sample_rate + 16);
+            resampled_samples.resize(out_len);
+
+            speex_resampler_process_int(tech_pvt->inject_resampler,
+                                        0,
+                                        in,
+                                        &in_len,
+                                        reinterpret_cast<spx_int16_t *>(resampled_samples.data()),
+                                        &out_len);
+            resampled_samples.resize(out_len);
+            input_ptr = reinterpret_cast<const uint8_t *>(resampled_samples.data());
+            input_len = resampled_samples.size() * sizeof(int16_t);
+        }
+
+        switch_mutex_lock(tech_pvt->inject_mutex);
+        switch_size_t in_use = switch_buffer_inuse(tech_pvt->inject_buffer);
+        switch_size_t free_bytes = switch_buffer_freespace(tech_pvt->inject_buffer);
+        const switch_size_t capacity = in_use + free_bytes;
+
+        const uint8_t *write_ptr = input_ptr;
+        switch_size_t write_len = static_cast<switch_size_t>(input_len);
+
+        // If incoming chunk is larger than total buffer capacity, keep only newest tail.
+        if (write_len > capacity) {
+            write_ptr = input_ptr + (write_len - capacity);
+            write_len = capacity;
+        }
+
+        if (write_len > free_bytes) {
+            const switch_size_t bytes_to_drop = write_len - free_bytes;
+            std::vector<uint8_t> drop_tmp(bytes_to_drop);
+            const switch_size_t dropped = switch_buffer_read(tech_pvt->inject_buffer, drop_tmp.data(), bytes_to_drop);
+            if (dropped < bytes_to_drop) {
+                switch_buffer_zero(tech_pvt->inject_buffer);
+                in_use = 0;
+                free_bytes = switch_buffer_freespace(tech_pvt->inject_buffer);
+            } else {
+                in_use = switch_buffer_inuse(tech_pvt->inject_buffer);
+                free_bytes = switch_buffer_freespace(tech_pvt->inject_buffer);
+            }
+        }
+
+        const switch_size_t bytes_to_write = (write_len <= free_bytes) ? write_len : free_bytes;
+        if (bytes_to_write > 0) {
+            switch_buffer_write(tech_pvt->inject_buffer, write_ptr, bytes_to_write);
+        }
+        switch_mutex_unlock(tech_pvt->inject_mutex);
+
+        if (bytes_to_write == 0) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                "(%s) inject_audio_data: no space after recovery, dropping %zu bytes\n",
+                tech_pvt->sessionId, input_len);
+            return SWITCH_STATUS_FALSE;
+        }
+        
+        DEBUG_LOG(DEBUG_LEVEL_DEBUG, session, "inject_audio_data: queued %zu/%zu bytes at %d Hz", 
+                 static_cast<size_t>(bytes_to_write), input_len, sample_rate);
+        
+        return SWITCH_STATUS_SUCCESS;
+    }
+
+    switch_status_t process_injected_audio(switch_core_session_t *session, switch_frame_t *frame) {
+        if (!session || !frame) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        switch_channel_t *channel = switch_core_session_get_channel(session);
+        if (!channel) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        auto *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
+        if (!bug) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        auto *tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt || !tech_pvt->inject_audio_enabled || !tech_pvt->inject_buffer || !tech_pvt->inject_mutex) {
+            return SWITCH_STATUS_FALSE;
+        }
+
+        switch_mutex_lock(tech_pvt->inject_mutex);
+        const switch_size_t in_use = switch_buffer_inuse(tech_pvt->inject_buffer);
+        if (in_use == 0) {
+            switch_mutex_unlock(tech_pvt->inject_mutex);
+            return SWITCH_STATUS_FALSE;
+        }
+
+        const char *codec_name = nullptr;
+        if (frame->codec && frame->codec->implementation && frame->codec->implementation->iananame) {
+            codec_name = frame->codec->implementation->iananame;
+        }
+
+        const bool is_pcmu = codec_name && strcasecmp(codec_name, "PCMU") == 0;
+        const bool is_pcma = codec_name && strcasecmp(codec_name, "PCMA") == 0;
+
+        if (is_pcmu || is_pcma) {
+            const switch_size_t needed_pcm16 = static_cast<switch_size_t>(frame->samples * sizeof(int16_t));
+            const switch_size_t to_read = (needed_pcm16 <= in_use) ? needed_pcm16 : in_use;
+
+            std::vector<int16_t> pcm_buf(frame->samples, 0);
+            const switch_size_t read_bytes = switch_buffer_read(
+                tech_pvt->inject_buffer,
+                reinterpret_cast<uint8_t *>(pcm_buf.data()),
+                to_read);
+            switch_mutex_unlock(tech_pvt->inject_mutex);
+
+            if (read_bytes == 0) {
+                return SWITCH_STATUS_FALSE;
+            }
+
+            const switch_size_t got_samples = read_bytes / sizeof(int16_t);
+            uint8_t *out = reinterpret_cast<uint8_t *>(frame->data);
+            const switch_size_t out_samples = static_cast<switch_size_t>(frame->samples);
+            const switch_size_t encode_samples = (got_samples <= out_samples) ? got_samples : out_samples;
+
+            for (switch_size_t i = 0; i < encode_samples; ++i) {
+                out[i] = is_pcmu ? linear_to_ulaw(pcm_buf[i]) : linear_to_alaw(pcm_buf[i]);
+            }
+
+            const uint8_t silence_code = is_pcmu ? 0xFF : 0xD5;
+            if (encode_samples < out_samples) {
+                memset(out + encode_samples, silence_code, out_samples - encode_samples);
+            }
+        } else {
+            const switch_size_t to_read = static_cast<switch_size_t>((frame->datalen <= in_use) ? frame->datalen : in_use);
+            const switch_size_t read_bytes = switch_buffer_read(tech_pvt->inject_buffer,
+                                                                 reinterpret_cast<uint8_t *>(frame->data),
+                                                                 to_read);
+            switch_mutex_unlock(tech_pvt->inject_mutex);
+
+            if (read_bytes == 0) {
+                return SWITCH_STATUS_FALSE;
+            }
+
+            // Reemplaza audio saliente; si falta audio inyectado completa con silencio.
+            if (read_bytes < frame->datalen) {
+                memset(reinterpret_cast<uint8_t *>(frame->data) + read_bytes, 0, frame->datalen - read_bytes);
+            }
+        }
+        
+        return SWITCH_STATUS_SUCCESS;
+    }
+}

@@ -18,6 +18,14 @@
 
 typedef void (*responseHandler_t)(switch_core_session_t* session, const char* eventName, const char* json);
 
+// Audio mix mode enumeration
+typedef enum {
+    MIX_MODE_MONO = 0,           // Single channel (read only)
+    MIX_MODE_MIXED = 1,          // Mixed read+write in single mono channel
+    MIX_MODE_STEREO = 2,         // Stereo (2 channels: left=read, right=write)
+    MIX_MODE_ENHANCED_MIXED = 3  // Enhanced mixed with better quality mixing algorithm
+} audio_mix_mode_t;
+
 struct private_data {
     switch_mutex_t *mutex;
     char sessionId[MAX_SESSION_ID];
@@ -39,6 +47,21 @@ struct private_data {
     uint64_t dbg_bytes;
     uint32_t dbg_last_in;
     uint32_t dbg_last_out;
+
+    // Audio mix mode for streaming
+    audio_mix_mode_t mix_mode;
+
+    // Buffers for enhanced mixing
+    switch_buffer_t *read_buffer;
+    switch_buffer_t *write_buffer;
+
+    // Audio injection support
+    switch_buffer_t *inject_buffer;
+    switch_mutex_t *inject_mutex;
+    SpeexResamplerState *inject_resampler;
+    int inject_audio_enabled:1;
+    int inject_sample_rate;
+    int inject_channels;
 };
 
 typedef struct private_data private_t;
