@@ -34,6 +34,11 @@ struct private_data {
     switch_buffer_t *sbuffer;
     uint8_t *data;
     int rtp_packets;
+    uint32_t dbg_frames;
+    uint32_t dbg_cng_skip;
+    uint64_t dbg_bytes;
+    uint32_t dbg_last_in;
+    uint32_t dbg_last_out;
 };
 
 typedef struct private_data private_t;

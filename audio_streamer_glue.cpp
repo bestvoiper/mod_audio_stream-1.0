@@ -1,5 +1,10 @@
 #include <string>
 #include <cstring>
+#include <vector>
+#include <thread>
+#include <condition_variable>
+#include <chrono>
+#include <algorithm>
 #include "mod_audio_stream.h"
 
 // =============================================================================
@@ -21,6 +26,8 @@
 #include "base64.h"
 
 #define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
+/* If Vosk/proxy stall, keep ~2.5s instead of dropping to 400ms (that skipped late greetings). */
+#define STREAM_WS_BACKLOG_MS 2500
 
 // Debug level constants
 #define DEBUG_LEVEL_NONE     0
@@ -129,6 +136,8 @@ public:
                 webSocket.setPingInterval(heart_beat);
                 DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "Set ping interval to %d seconds for session %s", heart_beat, uuid);
             }
+            webSocket.setConnectionTimeout(15);
+            DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "Set websocket connect timeout to 15s for session %s", uuid);
             
             if(deflate) {
                 webSocket.enableCompression(false);
@@ -156,7 +165,9 @@ public:
 
             webSocket.setOpenCallback([this](){
                 m_connected = true;
-                DEBUG_LOG_GLOBAL(DEBUG_LEVEL_INFO, "WebSocket connection opened for session %s", m_sessionId.c_str());
+                switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                                  "mod_audio_stream: WebSocket opened for session %s (queued %zu bytes before open)\n",
+                                  m_sessionId.c_str(), m_send_used);
                 cJSON *root = cJSON_CreateObject();
                 if (root) {
                     cJSON_AddStringToObject(root, "status", "connected");
@@ -167,10 +178,13 @@ public:
                     }
                     cJSON_Delete(root);
                 }
+                /* Metadata goes first (CONNECT_SUCCESS), then audio captured during handshake. */
+                flushPendingAudio();
             });
 
             webSocket.setErrorCallback([this](int error_code, const std::string& error_message){
                 m_connected = false;
+                m_audio_ready = false;
                 DEBUG_LOG_GLOBAL(DEBUG_LEVEL_ERROR, "WebSocket error for session %s: %s (code: %d)", 
                                m_sessionId.c_str(), error_message.c_str(), error_code);
                 
@@ -195,6 +209,7 @@ public:
 
             webSocket.setCloseCallback([this](int code, const std::string& reason){
                 m_connected = false;
+                m_audio_ready = false;
                 DEBUG_LOG_GLOBAL(DEBUG_LEVEL_INFO, "WebSocket connection closed for session %s, code: %d, reason: %s", 
                                m_sessionId.c_str(), code, reason.c_str());
                 
@@ -217,8 +232,10 @@ public:
                 }
             });
 
-            DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "Starting WebSocket for session %s", uuid);
-            webSocket.connect();
+            /* Connect after the media bug is attached so early-media frames
+               are queued from the first RTP packet, not dropped during TLS/DNS. */
+            startSender();
+            DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "AudioStreamer ready for session %s (websocket deferred)", uuid);
             
         } catch (const std::exception& e) {
             DEBUG_LOG_GLOBAL(DEBUG_LEVEL_ERROR, "Exception in AudioStreamer constructor for session %s: %s", 
@@ -380,6 +397,7 @@ public:
 
     ~AudioStreamer() {
         DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "Destroying AudioStreamer for session %s", m_sessionId.c_str());
+        stopSender();
         
         // Unregister this session
         {
@@ -394,28 +412,49 @@ public:
 
     void disconnect() {
         m_connected = false;
+        m_audio_ready = false;
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "disconnecting session %s...\n", m_sessionId.c_str());
+        stopSender();
         webSocket.disconnect();
+    }
+
+    void start() {
+        DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "Starting WebSocket for session %s", m_sessionId.c_str());
+        webSocket.connect();
     }
 
     bool isConnected() {
         return m_connected && webSocket.isConnected();
     }
 
+    void setPcmFormat(int rate, int channels) {
+        if (rate <= 0) {
+            rate = 8000;
+        }
+        if (channels <= 0) {
+            channels = 1;
+        }
+        /* ~100ms of live audio. A larger backlog never drains if WSS is realtime. */
+        m_bytes_per_ms = (size_t) rate * (size_t) channels * sizeof(int16_t) / 1000;
+        if (!m_bytes_per_ms) {
+            m_bytes_per_ms = 16;
+        }
+        m_live_cap = m_bytes_per_ms * 100;
+        if (m_live_cap < 640) {
+            m_live_cap = 640;
+        }
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                          "mod_audio_stream: live send cap %zu bytes (~100ms) rate=%dHz ch=%d session %s\n",
+                          m_live_cap, rate, channels, m_sessionId.c_str());
+    }
+
+    /* Media thread: memcpy only. A sender thread talks to the websocket so a
+       slow WSS cannot stall RTP and overflow the media-bug buffer (cuts). */
     void writeBinary(uint8_t* buffer, size_t len) {
-        if(!this->isConnected()) {
-            DEBUG_LOG_GLOBAL(DEBUG_LEVEL_VERBOSE, "Attempted to write binary data to disconnected session %s", 
-                           m_sessionId.c_str());
+        if (!buffer || !len || m_send_stop.load()) {
             return;
         }
-        try {
-            DEBUG_LOG_GLOBAL(DEBUG_LEVEL_VERBOSE, "Writing %zu bytes to session %s", len, m_sessionId.c_str());
-            webSocket.sendBinary(buffer, len);
-        } catch (const std::exception& e) {
-            DEBUG_LOG_GLOBAL(DEBUG_LEVEL_ERROR, "Error sending binary data to session %s: %s", 
-                           m_sessionId.c_str(), e.what());
-            m_connected = false;
-        }
+        enqueuePcm(buffer, len);
     }
 
     void writeText(const char* text) {
@@ -436,7 +475,187 @@ public:
         }
     }
 
+    void flushPendingAudio() {
+        size_t queued = 0;
+        {
+            std::lock_guard<std::mutex> lock(m_send_mutex);
+            queued = m_send_used;
+            /* Do not trim pre-connect silence/ring to 100ms. That discarded the
+               leading CNG and shifted the voicemail (19s FS → 15s AMD). Vosk
+               consumes a burst immediately; the WAV stays aligned with record_session. */
+            m_audio_ready = true;
+        }
+        if (queued) {
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                              "mod_audio_stream: releasing %zu queued bytes (~%zu ms) for session %s\n",
+                              queued, m_bytes_per_ms ? queued / m_bytes_per_ms : 0, m_sessionId.c_str());
+        }
+        m_send_cv.notify_one();
+    }
+
+    void startSender() {
+        if (m_sender_started.exchange(true)) {
+            return;
+        }
+        m_send_stop = false;
+        m_send_ring.assign(SEND_RING_BYTES, 0);
+        m_send_cap = SEND_RING_BYTES;
+        m_send_head = m_send_tail = m_send_used = 0;
+        m_send_thread = std::thread([this] { senderLoop(); });
+    }
+
+    void stopSender() {
+        if (!m_sender_started.load()) {
+            return;
+        }
+        m_send_stop = true;
+        m_send_cv.notify_all();
+        if (m_send_thread.joinable()) {
+            m_send_thread.join();
+        }
+        m_sender_started = false;
+    }
+
+    void enqueuePcm(const uint8_t *data, size_t len) {
+        std::lock_guard<std::mutex> lock(m_send_mutex);
+        if (!m_send_cap || m_send_ring.empty()) {
+            return;
+        }
+        if (len >= m_send_cap) {
+            data += (len - (m_send_cap - 1));
+            len = m_send_cap - 1;
+        }
+        while (m_send_used + len > m_send_cap && m_send_used > 0) {
+            size_t drop = std::min(m_send_used, std::max(len, (size_t) 320));
+            m_send_tail = (m_send_tail + drop) % m_send_cap;
+            m_send_used -= drop;
+            m_dropped_bytes += drop;
+            if (m_dropped_bytes == drop || (m_dropped_bytes / 16000) != ((m_dropped_bytes - drop) / 16000)) {
+                DEBUG_LOG_GLOBAL(DEBUG_LEVEL_WARNING,
+                               "Send queue overflow for session %s; dropped oldest audio (total dropped %zu bytes)",
+                               m_sessionId.c_str(), m_dropped_bytes);
+            }
+        }
+        size_t first = std::min(len, m_send_cap - m_send_head);
+        memcpy(&m_send_ring[m_send_head], data, first);
+        if (len > first) {
+            memcpy(&m_send_ring[0], data + first, len - first);
+        }
+        m_send_head = (m_send_head + len) % m_send_cap;
+        m_send_used += len;
+        /* Before the socket is up, keep up to 5s (ring/CNG during TLS). After
+           connect, keep STREAM_WS_BACKLOG_MS so a slow AMD does not skip the greeting. */
+        if (!m_audio_ready.load()) {
+            const size_t preconnect = m_bytes_per_ms ? (m_bytes_per_ms * 5000) : 80000;
+            if (m_send_used > preconnect) {
+                size_t discarded = m_send_used - preconnect;
+                m_send_tail = (m_send_tail + discarded) % m_send_cap;
+                m_send_used = preconnect;
+                m_dropped_bytes += discarded;
+            }
+        } else {
+            const size_t jitter = m_bytes_per_ms ? (m_bytes_per_ms * STREAM_WS_BACKLOG_MS) : 40000;
+            if (m_send_used > jitter) {
+                size_t discarded = m_send_used - jitter;
+                m_send_tail = (m_send_tail + discarded) % m_send_cap;
+                m_send_used = jitter;
+                m_dropped_bytes += discarded;
+            }
+        }
+        m_send_cv.notify_one();
+    }
+
+    size_t dropToLiveCapLocked() {
+        size_t discarded = 0;
+        if (!m_live_cap || m_send_used <= m_live_cap) {
+            return 0;
+        }
+        discarded = m_send_used - m_live_cap;
+        m_send_tail = (m_send_tail + discarded) % m_send_cap;
+        m_send_used = m_live_cap;
+        m_dropped_bytes += discarded;
+        return discarded;
+    }
+
+    void senderLoop() {
+        uint8_t chunk[1280];
+        while (!m_send_stop.load()) {
+            std::unique_lock<std::mutex> lock(m_send_mutex);
+            m_send_cv.wait_for(lock, std::chrono::milliseconds(20), [this] {
+                return m_send_stop.load() ||
+                       (m_audio_ready.load() && m_connected.load() && m_send_used > 0);
+            });
+            if (m_send_stop.load()) {
+                break;
+            }
+            if (!m_audio_ready.load() || !m_connected.load() || m_send_used == 0) {
+                continue;
+            }
+            /* Do not hold the send mutex while inspecting the WS socket. */
+            lock.unlock();
+
+            const size_t pending = webSocket.outboundQueuedBytes();
+            const size_t watermark = m_bytes_per_ms ? (m_bytes_per_ms * STREAM_WS_BACKLOG_MS) : 40000;
+
+            lock.lock();
+            if (pending > watermark) {
+                size_t discarded = 0;
+                if (m_send_used > watermark) {
+                    discarded = m_send_used - watermark;
+                    m_send_tail = (m_send_tail + discarded) % m_send_cap;
+                    m_send_used = watermark;
+                    m_dropped_bytes += discarded;
+                }
+                lock.unlock();
+                auto now = std::chrono::steady_clock::now();
+                if (discarded && (m_last_lag_log.time_since_epoch().count() == 0 ||
+                                  now - m_last_lag_log > std::chrono::seconds(2))) {
+                    m_last_lag_log = now;
+                    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                                      "mod_audio_stream: WSS output buffer %zu bytes (~%zu ms); dropped %zu bytes to stay live for session %s\n",
+                                      pending,
+                                      m_bytes_per_ms ? pending / m_bytes_per_ms : 0,
+                                      discarded, m_sessionId.c_str());
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            /* One 20ms frame. Dumping 80ms+ bursts fills the TCP buffer and recreates the lag. */
+            size_t frame_bytes = m_bytes_per_ms ? (m_bytes_per_ms * 20) : 320;
+            if (frame_bytes < 320) {
+                frame_bytes = 320;
+            }
+            if (frame_bytes > sizeof(chunk)) {
+                frame_bytes = sizeof(chunk);
+            }
+            size_t n = std::min(m_send_used, frame_bytes);
+            size_t first = std::min(n, m_send_cap - m_send_tail);
+            memcpy(chunk, &m_send_ring[m_send_tail], first);
+            if (n > first) {
+                memcpy(chunk + first, &m_send_ring[0], n - first);
+            }
+            m_send_tail = (m_send_tail + n) % m_send_cap;
+            m_send_used -= n;
+            lock.unlock();
+
+            try {
+                if (!webSocket.sendBinary(chunk, n)) {
+                    m_connected = false;
+                    m_audio_ready = false;
+                }
+            } catch (const std::exception &e) {
+                DEBUG_LOG_GLOBAL(DEBUG_LEVEL_ERROR, "Sender thread error for session %s: %s",
+                               m_sessionId.c_str(), e.what());
+                m_connected = false;
+                m_audio_ready = false;
+            }
+        }
+    }
+
 private:
+    static const size_t SEND_RING_BYTES = 16000 * 2 * 2 * 4; /* 4s @ 16kHz stereo */
+
     std::string m_sessionId;
     responseHandler_t m_notify;
     WebSocketClient webSocket;
@@ -446,6 +665,21 @@ private:
     int m_playFile;
     std::unordered_set<std::string> m_Files;
     std::atomic<bool> m_connected;
+    std::atomic<bool> m_audio_ready{false};
+    std::mutex m_send_mutex;
+    std::condition_variable m_send_cv;
+    std::vector<uint8_t> m_send_ring;
+    size_t m_send_cap = 0;
+    size_t m_send_head = 0;
+    size_t m_send_tail = 0;
+    size_t m_send_used = 0;
+    size_t m_dropped_bytes = 0;
+    size_t m_live_cap = 1600; /* 100ms @ 8kHz mono until setPcmFormat */
+    size_t m_bytes_per_ms = 16;
+    std::thread m_send_thread;
+    std::atomic<bool> m_send_stop{false};
+    std::atomic<bool> m_sender_started{false};
+    std::chrono::steady_clock::time_point m_last_lag_log{};
 };
 
 
@@ -505,7 +739,7 @@ namespace {
         const size_t buflen = (FRAME_SIZE_8000 * desiredSampling / 8000 * channels * rtp_packets);
 
         auto* as = new AudioStreamer(tech_pvt->sessionId, wsUri, responseHandler, deflate, heart_beat, globalTrace, suppressLog, extra_headers, no_reconnect);
-
+        as->setPcmFormat(desiredSampling, channels);
         tech_pvt->pAudioStreamer = static_cast<void *>(as);
 
         switch_mutex_init(&tech_pvt->mutex, SWITCH_MUTEX_NESTED, pool);
@@ -925,7 +1159,7 @@ extern "C" {
 
         // Initialize variables with default values
         int deflate = 0;
-        int heart_beat = 0;
+        int heart_beat = 10; /* keep WSS alive during long ring / delayed voicemail */
         bool globalTrace = false;
         bool suppressLog = false;
         const char* buffer_size = nullptr;
@@ -1015,6 +1249,214 @@ extern "C" {
         return SWITCH_STATUS_SUCCESS;
     }
 
+    void stream_session_start(void *pUserData)
+    {
+        if (!pUserData) {
+            return;
+        }
+        auto *tech_pvt = static_cast<private_t *>(pUserData);
+        if (!tech_pvt->pAudioStreamer) {
+            return;
+        }
+        auto *pAudioStreamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
+        pAudioStreamer->start();
+    }
+
+    static void send_pcm_bytes(private_t *tech_pvt, AudioStreamer *pAudioStreamer,
+                               const uint8_t *data, uint32_t datalen, uint32_t samples)
+    {
+        if (!data || !datalen) {
+            return;
+        }
+
+        if (nullptr == tech_pvt->resampler) {
+            if (1 == tech_pvt->rtp_packets) {
+                pAudioStreamer->writeBinary(const_cast<uint8_t *>(data), datalen);
+                return;
+            }
+
+            size_t available = ringBufferFreeSpace(tech_pvt->buffer);
+            size_t remaining = 0;
+            if (available >= datalen) {
+                ringBufferAppendMultiple(tech_pvt->buffer, data, datalen);
+            } else {
+                ringBufferAppendMultiple(tech_pvt->buffer, data, available);
+                remaining = datalen - available;
+            }
+
+            if (0 == ringBufferFreeSpace(tech_pvt->buffer)) {
+                size_t nFrames = ringBufferLen(tech_pvt->buffer);
+                size_t nBytes = nFrames + remaining;
+                uint8_t chunkPtr[nBytes];
+                ringBufferGetMultiple(tech_pvt->buffer, &chunkPtr[0], nFrames);
+
+                if (remaining > 0) {
+                    memcpy(&chunkPtr[nFrames], data + datalen - remaining, remaining);
+                }
+
+                pAudioStreamer->writeBinary(chunkPtr, nBytes);
+                ringBufferClear(tech_pvt->buffer);
+            }
+            return;
+        }
+
+        const size_t available = switch_buffer_freespace(tech_pvt->sbuffer);
+        spx_uint32_t in_len = samples ? samples : (datalen / (tech_pvt->channels * sizeof(spx_int16_t)));
+        spx_uint32_t out_len = (spx_uint32_t) (available / (tech_pvt->channels * sizeof(spx_int16_t)));
+        if (!out_len) {
+            return;
+        }
+        spx_int16_t out[available / sizeof(spx_int16_t)];
+
+        if (tech_pvt->channels == 1) {
+            speex_resampler_process_int(tech_pvt->resampler,
+                            0,
+                            (const spx_int16_t *) data,
+                            &in_len,
+                            &out[0],
+                            &out_len);
+        } else {
+            speex_resampler_process_interleaved_int(tech_pvt->resampler,
+                            (const spx_int16_t *) data,
+                            &in_len,
+                            &out[0],
+                            &out_len);
+        }
+
+        if (out_len > 0) {
+            const size_t bytes_written = out_len * tech_pvt->channels * sizeof(spx_int16_t);
+            if (tech_pvt->rtp_packets == 1) {
+                pAudioStreamer->writeBinary((uint8_t *) out, bytes_written);
+                return;
+            }
+            if (bytes_written <= available) {
+                switch_buffer_write(tech_pvt->sbuffer, (const uint8_t *) out, bytes_written);
+            }
+        }
+
+        if (switch_buffer_freespace(tech_pvt->sbuffer) == 0) {
+            const switch_size_t buf_len = switch_buffer_inuse(tech_pvt->sbuffer);
+            uint8_t buf_ptr[buf_len];
+            switch_buffer_read(tech_pvt->sbuffer, buf_ptr, buf_len);
+            switch_buffer_zero(tech_pvt->sbuffer);
+            pAudioStreamer->writeBinary(buf_ptr, buf_len);
+        }
+    }
+
+    static uint32_t clamp_pcm_bytes(const switch_frame_t *frame, int channels, uint32_t rate)
+    {
+        /* record_session writes real samples. The media path often hands us a
+           30ms slot for 20ms RTP (zeros / CNG tail). Sending the slot as-is
+           stretches 19s of ring into ~25s and the voicemail "starts late". */
+        if (!frame || !frame->data || !frame->datalen) {
+            return 0;
+        }
+
+        uint32_t ch = channels > 0 ? (uint32_t) channels : (frame->channels ? frame->channels : 1);
+        uint32_t datalen = frame->datalen;
+        if (datalen % 2) {
+            datalen--;
+        }
+
+        if (frame->samples && ch) {
+            uint32_t from_samples = frame->samples * (uint32_t) sizeof(int16_t) * ch;
+            if (from_samples && from_samples < datalen) {
+                datalen = from_samples;
+            }
+        }
+
+        if (frame->codec && frame->codec->implementation && ch) {
+            uint32_t native = frame->codec->implementation->samples_per_packet;
+            uint32_t native_bytes = native * (uint32_t) sizeof(int16_t) * ch;
+            if (native_bytes && datalen > native_bytes) {
+                datalen = native_bytes;
+            }
+        }
+
+        if (!rate) {
+            rate = 8000;
+        }
+        const uint32_t bytes_20ms = (rate / 50) * (uint32_t) sizeof(int16_t) * ch;
+        if (bytes_20ms && datalen > bytes_20ms) {
+            /* Always 20ms, even if the extra 10ms has ring energy. Sending
+               30ms per 20ms callback is what moved the greeting from 13s to 21s. */
+            datalen = bytes_20ms;
+        }
+        return datalen;
+    }
+
+    static int pcm_peak(const uint8_t *data, uint32_t len)
+    {
+        if (!data || len < 2) {
+            return 0;
+        }
+        const int16_t *s = reinterpret_cast<const int16_t *>(data);
+        uint32_t n = len / 2;
+        int peak = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            int a = s[i] < 0 ? -s[i] : s[i];
+            if (a > peak) {
+                peak = a;
+            }
+        }
+        return peak;
+    }
+
+    /* media_bug_read fill uses 0xFF (int16 -1). Real decoded silence is ~0. */
+    static bool pcm_is_bug_padding(const uint8_t *data, uint32_t len)
+    {
+        if (!data || len < 2) {
+            return true;
+        }
+        const int16_t *s = reinterpret_cast<const int16_t *>(data);
+        uint32_t n = len / 2;
+        uint32_t pad = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (s[i] == -1) {
+                pad++;
+            }
+        }
+        return pad * 2 >= n;
+    }
+
+    static void note_pcm_sent(private_t *tech_pvt, const uint8_t *data, uint32_t in_len, uint32_t out_len)
+    {
+        tech_pvt->dbg_frames++;
+        tech_pvt->dbg_bytes += out_len;
+        tech_pvt->dbg_last_in = in_len;
+        tech_pvt->dbg_last_out = out_len;
+        if (tech_pvt->dbg_frames <= 8 || (tech_pvt->dbg_frames % 250) == 0) {
+            uint32_t rate = tech_pvt->sampling > 0 ? (uint32_t) tech_pvt->sampling : 8000;
+            uint32_t ch = tech_pvt->channels > 0 ? (uint32_t) tech_pvt->channels : 1;
+            uint64_t ms = 0;
+            if (rate && ch) {
+                ms = (tech_pvt->dbg_bytes * 1000) / (rate * ch * sizeof(int16_t));
+            }
+            int peak = pcm_peak(data, out_len);
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+                              "mod_audio_stream: pcm frame #%u in=%u out=%u peak=%d (~%lums sent, cng_as_silence=%u) session %s\n",
+                              tech_pvt->dbg_frames, in_len, out_len, peak,
+                              (unsigned long) ms, tech_pvt->dbg_cng_skip, tech_pvt->sessionId);
+        }
+    }
+
+    static void emit_clock_silence(private_t *tech_pvt, AudioStreamer *pAudioStreamer, uint32_t rate)
+    {
+        uint32_t ch = tech_pvt->channels > 0 ? (uint32_t) tech_pvt->channels : 1;
+        if (!rate) {
+            rate = tech_pvt->sampling > 0 ? (uint32_t) tech_pvt->sampling : 8000;
+        }
+        uint32_t sil = (rate / 50) * (uint32_t) sizeof(int16_t) * ch;
+        if (!sil || sil > 2048) {
+            sil = 320;
+        }
+        static const uint8_t zeros[2048] = {0};
+        uint32_t samples = sil / (sizeof(int16_t) * ch);
+        tech_pvt->dbg_cng_skip++;
+        note_pcm_sent(tech_pvt, zeros, sil, sil);
+        send_pcm_bytes(tech_pvt, pAudioStreamer, zeros, sil, samples);
+    }
+
     switch_bool_t stream_frame(switch_media_bug_t *bug)
     {
         auto* tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
@@ -1022,8 +1464,7 @@ extern "C" {
             return SWITCH_TRUE;
         }
 
-        // Use trylock to prevent blocking
-        if (switch_mutex_trylock(tech_pvt->mutex) != SWITCH_STATUS_SUCCESS) {
+        if (switch_mutex_lock(tech_pvt->mutex) != SWITCH_STATUS_SUCCESS) {
             return SWITCH_TRUE;
         }
 
@@ -1034,98 +1475,51 @@ extern "C" {
 
         auto *pAudioStreamer = static_cast<AudioStreamer *>(tech_pvt->pAudioStreamer);
 
-        if(!pAudioStreamer->isConnected()) {
-            switch_mutex_unlock(tech_pvt->mutex);
-            return SWITCH_TRUE;
-        }
-
         try {
-            // ...existing frame processing code with better error handling...
-            if (nullptr == tech_pvt->resampler) {
-                uint8_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
-                switch_frame_t frame = {};
-                frame.data = data;
-                frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
-                size_t available = ringBufferFreeSpace(tech_pvt->buffer);
-                while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS && !tech_pvt->close_requested) {
-                    if(frame.datalen) {
-                        if (1 == tech_pvt->rtp_packets) {
-                            pAudioStreamer->writeBinary((uint8_t *) frame.data, frame.datalen);
-                            continue;
-                        }
+            /* fill=TRUE on read-only: empty buffer → FALSE (stops the loop).
+               fill=FALSE on mixed: allow one-sided early media without blocking. */
+            const switch_bool_t fill = switch_core_media_bug_test_flag(bug, SMBF_WRITE_STREAM)
+                ? SWITCH_FALSE : SWITCH_TRUE;
 
-                        size_t remaining = 0;
-                        if(available >= frame.datalen) {
-                            ringBufferAppendMultiple(tech_pvt->buffer, static_cast<uint8_t *>(frame.data), frame.datalen);
-                        } else {
-                            ringBufferAppendMultiple(tech_pvt->buffer, static_cast<uint8_t *>(frame.data), available);
-                            remaining = frame.datalen - available;
-                        }
+            uint8_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
+            switch_frame_t frame = {};
+            frame.data = data;
+            frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
 
-                        if(0 == ringBufferFreeSpace(tech_pvt->buffer)) {
-                            size_t nFrames = ringBufferLen(tech_pvt->buffer);
-                            size_t nBytes = nFrames + remaining;
-                            uint8_t chunkPtr[nBytes];
-                            ringBufferGetMultiple(tech_pvt->buffer, &chunkPtr[0], nBytes);
-
-                            if(remaining > 0) {
-                                memcpy(&chunkPtr[nBytes - remaining], static_cast<uint8_t *>(frame.data) + frame.datalen - remaining, remaining);
-                            }
-
-                            pAudioStreamer->writeBinary(chunkPtr, nBytes);
-                            ringBufferClear(tech_pvt->buffer);
-                        }
-                    }
+            int reads = 0;
+            int sent_audio = 0;
+            int saw_placeholder = 0;
+            uint32_t last_rate = 8000;
+            while (reads < 8 &&
+                   switch_core_media_bug_read(bug, &frame, fill) == SWITCH_STATUS_SUCCESS &&
+                   !tech_pvt->close_requested) {
+                reads++;
+                uint32_t rate = frame.rate ? frame.rate : (uint32_t) tech_pvt->sampling;
+                last_rate = rate;
+                if (!frame.datalen || switch_test_flag(&frame, SFF_CNG) ||
+                    pcm_is_bug_padding(static_cast<const uint8_t *>(frame.data), frame.datalen)) {
+                    saw_placeholder = 1;
+                    continue;
                 }
-            } else {
-                // ...existing resampling code...
-                uint8_t data[SWITCH_RECOMMENDED_BUFFER_SIZE];
-                switch_frame_t frame = {};
-                frame.data = data;
-                frame.buflen = SWITCH_RECOMMENDED_BUFFER_SIZE;
-                const size_t available = switch_buffer_freespace(tech_pvt->sbuffer);
 
-                while (switch_core_media_bug_read(bug, &frame, SWITCH_TRUE) == SWITCH_STATUS_SUCCESS && !tech_pvt->close_requested) {
-                    if(frame.datalen) {
-                        spx_uint32_t in_len = frame.samples;
-                        spx_uint32_t out_len = (available / (tech_pvt->channels * sizeof(spx_int16_t)));
-                        spx_int16_t out[available / sizeof(spx_int16_t)];
-
-                        if(tech_pvt->channels == 1) {
-                            speex_resampler_process_int(tech_pvt->resampler,
-                                            0,
-                                            (const spx_int16_t *)frame.data,
-                                            &in_len,
-                                            &out[0],
-                                            &out_len);
-                        } else {
-                            speex_resampler_process_interleaved_int(tech_pvt->resampler,
-                                            (const spx_int16_t *)frame.data,
-                                            &in_len,
-                                            &out[0],
-                                            &out_len);
-                        }
-
-                        if(out_len > 0) {
-                            const size_t bytes_written = out_len * tech_pvt->channels * sizeof(spx_int16_t);
-                            if (tech_pvt->rtp_packets == 1) {
-                                pAudioStreamer->writeBinary((uint8_t *) out, bytes_written);
-                                continue;
-                            }
-                            if (bytes_written <= available) {
-                                switch_buffer_write(tech_pvt->sbuffer, (const uint8_t *)out, bytes_written);
-                            }
-                        }
-
-                        if(switch_buffer_freespace(tech_pvt->sbuffer) == 0) {
-                            const switch_size_t buf_len= switch_buffer_inuse(tech_pvt->sbuffer);
-                            uint8_t buf_ptr[buf_len];
-                            switch_buffer_read(tech_pvt->sbuffer, buf_ptr, buf_len);
-                            switch_buffer_zero(tech_pvt->sbuffer);
-                            pAudioStreamer->writeBinary(buf_ptr, buf_len);
-                        }
-                    }
+                uint32_t datalen = clamp_pcm_bytes(&frame, tech_pvt->channels, rate);
+                uint32_t samples = 0;
+                if (datalen && tech_pvt->channels > 0) {
+                    samples = datalen / (sizeof(int16_t) * (uint32_t) tech_pvt->channels);
                 }
+                if (datalen) {
+                    note_pcm_sent(tech_pvt, static_cast<const uint8_t *>(frame.data),
+                                   frame.datalen, datalen);
+                    send_pcm_bytes(tech_pvt, pAudioStreamer, static_cast<const uint8_t *>(frame.data),
+                                   datalen, samples);
+                    sent_audio++;
+                }
+            }
+            /* CNG/0xFF is the early-media "silence" record_session writes (peak 1–2).
+               Send one 20ms zero frame per callback — not one per extra fill read,
+               or the greeting stretches (13s → 21s). */
+            if (sent_audio == 0 && saw_placeholder) {
+                emit_clock_silence(tech_pvt, pAudioStreamer, last_rate);
             }
         } catch (const std::exception& e) {
             switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error in stream_frame: %s\n", e.what());

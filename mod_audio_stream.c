@@ -44,7 +44,25 @@ static switch_bool_t capture_callback(switch_media_bug_t *bug, void *user_data, 
             return stream_frame(bug);
             break;
 
+        case SWITCH_ABC_TYPE_READ_REPLACE:
+            /* mono: actual decoded frame, no 30ms media-bug padding. */
+            if (tech_pvt->close_requested) {
+                return SWITCH_FALSE;
+            }
+            return stream_frame(bug);
+            break;
+
         case SWITCH_ABC_TYPE_WRITE:
+            /* write-only capture (far-end / early media on A-leg). Mixed/stereo
+               already consume both buffers from the READ callback. */
+            if (tech_pvt->close_requested) {
+                return SWITCH_FALSE;
+            }
+            if (!switch_core_media_bug_test_flag(bug, SMBF_READ_STREAM)) {
+                return stream_frame(bug);
+            }
+            break;
+
         default:
             break;
     }
@@ -71,25 +89,84 @@ static switch_status_t start_capture(switch_core_session_t *session,
         return SWITCH_STATUS_FALSE;
     }
 
-    read_codec = switch_core_session_get_read_codec(session);
-
-    if (switch_channel_pre_answer(channel) != SWITCH_STATUS_SUCCESS) {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: channel must have reached pre-answer status before calling start!\n");
-        return SWITCH_STATUS_FALSE;
+    /* Early media: execute_on_media can fire before the read codec is ready.
+       Prefer read_impl (often set first) and wait at most ~100ms so we do not
+       miss the start of a voicemail greeting. */
+    if (!switch_channel_media_ready(channel)) {
+        if (switch_channel_pre_answer(channel) != SWITCH_STATUS_SUCCESS) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                              "mod_audio_stream: pre-answer not ready yet, waiting for media (early media)...\n");
+        }
     }
 
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "calling stream_session_init.\n");
-    if (SWITCH_STATUS_FALSE == stream_session_init(session, responseHandler, read_codec->implementation->actual_samples_per_second,
-                                                 wsUri, sampling, channels, metadata, &pUserData)) {
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing mod_audio_stream session.\n");
-        return SWITCH_STATUS_FALSE;
+    {
+        int tries;
+        switch_codec_implementation_t read_impl = { 0 };
+        for (tries = 0; tries < 20; tries++) {
+            if (switch_channel_media_ready(channel)) {
+                read_codec = switch_core_session_get_read_codec(session);
+                if (read_codec && read_codec->implementation &&
+                    read_codec->implementation->actual_samples_per_second &&
+                    read_codec->implementation->decoded_bytes_per_packet) {
+                    break;
+                }
+                if (switch_core_session_get_read_impl(session, &read_impl) == SWITCH_STATUS_SUCCESS &&
+                    read_impl.actual_samples_per_second && read_impl.decoded_bytes_per_packet) {
+                    break;
+                }
+            }
+            switch_yield(5000);
+        }
     }
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "adding bug.\n");
-    if ((status = switch_core_media_bug_add(session, MY_BUG_NAME, NULL, capture_callback, pUserData, 0, flags, &bug)) != SWITCH_STATUS_SUCCESS) {
-        return status;
+
+    {
+        switch_codec_implementation_t read_impl = { 0 };
+        uint32_t native_rate = 0;
+
+        read_codec = switch_core_session_get_read_codec(session);
+        if (read_codec && read_codec->implementation &&
+            read_codec->implementation->actual_samples_per_second) {
+            native_rate = read_codec->implementation->actual_samples_per_second;
+        } else if (switch_core_session_get_read_impl(session, &read_impl) == SWITCH_STATUS_SUCCESS) {
+            native_rate = read_impl.actual_samples_per_second;
+        }
+
+        if (!native_rate) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
+                              "mod_audio_stream: read codec not ready. Start after CHANNEL_PROGRESS_MEDIA / execute_on_media.\n");
+            return SWITCH_STATUS_FALSE;
+        }
+
+        if (!switch_channel_media_ready(channel) &&
+            switch_channel_pre_answer(channel) != SWITCH_STATUS_SUCCESS) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "mod_audio_stream: channel must have reached pre-answer status before calling start!\n");
+            return SWITCH_STATUS_FALSE;
+        }
+
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                          "mod_audio_stream: starting capture native=%uHz target=%dHz media_ready=%d answered=%d early=%d flags=0x%x\n",
+                          native_rate, sampling,
+                          switch_channel_media_ready(channel) ? 1 : 0,
+                          switch_channel_test_flag(channel, CF_ANSWERED) ? 1 : 0,
+                          switch_channel_test_flag(channel, CF_EARLY_MEDIA) ? 1 : 0,
+                          flags);
+
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "calling stream_session_init.\n");
+        if (SWITCH_STATUS_FALSE == stream_session_init(session, responseHandler, native_rate,
+                                                     wsUri, sampling, channels, metadata, &pUserData)) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "Error initializing mod_audio_stream session.\n");
+            return SWITCH_STATUS_FALSE;
+        }
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "adding bug.\n");
+        if ((status = switch_core_media_bug_add(session, MY_BUG_NAME, NULL, capture_callback, pUserData, 0, flags, &bug)) != SWITCH_STATUS_SUCCESS) {
+            stream_session_cleanup(session, NULL, 0);
+            return status;
+        }
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "setting bug private data.\n");
+        switch_channel_set_private(channel, MY_BUG_NAME, bug);
+        /* Bug is attached: now open the websocket so early media can queue from packet 1. */
+        stream_session_start(pUserData);
     }
-    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "setting bug private data.\n");
-    switch_channel_set_private(channel, MY_BUG_NAME, bug);
 
     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG, "exiting start_capture.\n");
     return SWITCH_STATUS_SUCCESS;
@@ -135,7 +212,7 @@ static switch_status_t send_text(switch_core_session_t *session, char* text) {
     return status;
 }
 
-#define STREAM_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000] [metadata]"
+#define STREAM_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo | write] [8000 | 16000] [metadata]"
 SWITCH_STANDARD_API(stream_function)
 {
     char *mycmd = NULL, *argv[6] = { 0 };
@@ -186,7 +263,7 @@ SWITCH_STANDARD_API(stream_function)
                 //switch_channel_t *channel = switch_core_session_get_channel(lsession);
                 char wsUri[MAX_WS_URI];
                 int sampling = 8000;
-                switch_media_bug_flag_t flags = SMBF_READ_STREAM;
+                switch_media_bug_flag_t flags = SMBF_READ_PING | SMBF_NO_PAUSE;
                 char *metadata = argc > 5 ? argv[5] : NULL;
                 if(metadata && (is_valid_utf8(argv[2]) != SWITCH_STATUS_SUCCESS)) {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
@@ -195,13 +272,20 @@ SWITCH_STANDARD_API(stream_function)
                     goto done;
                 }
                 if (0 == strcmp(argv[3], "mixed")) {
-                    flags |= SMBF_WRITE_STREAM;
+                    flags |= SMBF_READ_STREAM | SMBF_WRITE_STREAM;
                 } else if (0 == strcmp(argv[3], "stereo")) {
-                    flags |= SMBF_WRITE_STREAM;
+                    flags |= SMBF_READ_STREAM | SMBF_WRITE_STREAM;
                     flags |= SMBF_STEREO;
-                } else if (0 != strcmp(argv[3], "mono")) {
+                } else if (0 == strcmp(argv[3], "write")) {
+                    /* Far-end only: A-leg write path (early media / voicemail greeting). */
+                    flags |= SMBF_WRITE_STREAM;
+                } else if (0 == strcmp(argv[3], "mono")) {
+                    /* READ_STREAM tap (does not intercept the codec). READ_REPLACE
+                       muted both the FS recording and the stream on this path. */
+                    flags |= SMBF_READ_STREAM;
+                } else {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR,
-                                      "invalid mix type: %s, must be mono, mixed, or stereo\n", argv[3]);
+                                      "invalid mix type: %s, must be mono, mixed, stereo, or write\n", argv[3]);
                     switch_core_session_rwunlock(lsession);
                     goto done;
                 }
