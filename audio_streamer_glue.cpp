@@ -730,37 +730,9 @@ public:
             if (!m_audio_ready.load() || !m_connected.load() || m_send_used == 0) {
                 continue;
             }
-            /* Do not hold the send mutex while inspecting the WS socket. */
-            lock.unlock();
-
-            const size_t pending = webSocket.outboundQueuedBytes();
-            const size_t watermark = m_bytes_per_ms ? (m_bytes_per_ms * STREAM_WS_BACKLOG_MS) : 40000;
-
-            lock.lock();
-            if (pending > watermark) {
-                size_t discarded = 0;
-                if (m_send_used > watermark) {
-                    discarded = m_send_used - watermark;
-                    m_send_tail = (m_send_tail + discarded) % m_send_cap;
-                    m_send_used = watermark;
-                    m_dropped_bytes += discarded;
-                }
-                lock.unlock();
-                auto now = std::chrono::steady_clock::now();
-                if (discarded && (m_last_lag_log.time_since_epoch().count() == 0 ||
-                                  now - m_last_lag_log > std::chrono::seconds(2))) {
-                    m_last_lag_log = now;
-                    switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-                                      "mod_audio_stream: WSS output buffer %zu bytes (~%zu ms); dropped %zu bytes to stay live for session %s\n",
-                                      pending,
-                                      m_bytes_per_ms ? pending / m_bytes_per_ms : 0,
-                                      discarded, m_sessionId.c_str());
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                continue;
-            }
-
-            /* One 20ms frame. Dumping 80ms+ bursts fills the TCP buffer and recreates the lag. */
+            /* Stock libwsc has no outboundQueuedBytes(); the send ring already
+               caps at STREAM_WS_BACKLOG_MS. Copy one 20ms frame then send
+               without holding the mutex. */
             size_t frame_bytes = m_bytes_per_ms ? (m_bytes_per_ms * 20) : 320;
             if (frame_bytes < 320) {
                 frame_bytes = 320;
