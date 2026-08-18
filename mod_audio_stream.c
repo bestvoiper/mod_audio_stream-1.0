@@ -294,7 +294,11 @@ SWITCH_STANDARD_API(stream_function)
                 //switch_channel_t *channel = switch_core_session_get_channel(lsession);
                 char wsUri[MAX_WS_URI];
                 int sampling = 8000;
-                switch_media_bug_flag_t flags = SMBF_READ_PING | SMBF_NO_PAUSE | SMBF_WRITE_REPLACE;
+                /* Do not set WRITE_REPLACE here. On outbound early media (183)
+                   that flag leaves the AMD tap on CNG/silence while record_session
+                   still sees the far-end greeting. Inject uses enable_inject after
+                   start; AMD mono must stay READ_STREAM|READ_PING|NO_PAUSE (0x411). */
+                switch_media_bug_flag_t flags = SMBF_READ_PING | SMBF_NO_PAUSE;
                 audio_mix_mode_t mix_mode = MIX_MODE_MONO;
                 char *metadata = argc > 5 ? argv[5] : NULL;
                 if(metadata && (is_valid_utf8(argv[2]) != SWITCH_STATUS_SUCCESS)) {
