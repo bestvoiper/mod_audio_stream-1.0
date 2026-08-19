@@ -300,10 +300,11 @@ public:
                 }
             });
 
-            /* Connect after the media bug is attached so early-media frames
-               are queued from the first RTP packet, not dropped during TLS/DNS. */
+            /* Handshake now, overlapping media-bug attach. PCM still queues
+               until CONNECT_SUCCESS so the greeting is not dropped. */
             startSender();
-            DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "AudioStreamer ready for session %s (websocket deferred)", uuid);
+            start();
+            DEBUG_LOG_GLOBAL(DEBUG_LEVEL_DEBUG, "AudioStreamer ready for session %s (websocket connecting)", uuid);
             
         } catch (const std::exception& e) {
             DEBUG_LOG_GLOBAL(DEBUG_LEVEL_ERROR, "Exception in AudioStreamer constructor for session %s: %s", 
