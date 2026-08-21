@@ -2,6 +2,3 @@
 	path = libs/IXWebSocket
 	url = https://github.com/machinezone/IXWebSocket
 
-[submodule "libs/libwsc"]
-	path = libs/libwsc
-	url = https://github.com/amigniter/libwsc

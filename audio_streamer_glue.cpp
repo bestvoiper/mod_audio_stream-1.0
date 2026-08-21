@@ -346,20 +346,28 @@ public:
             return;
         }
         
-        // Prevent multiple cleanup calls
-        if (tech_pvt->close_requested) {
-            return;
-        }
-        tech_pvt->close_requested = 1;
-        
-        // Clear private data FIRST to prevent "bug already attached" errors
-        switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
-        
-        // Do the actual cleanup
+        // Prevent multiple cleanup calls. This check-and-set MUST happen under
+        // tech_pvt->mutex: media_bug_close() can run on libwsc's event thread
+        // (triggered by a WS error) at the same time stream_session_cleanup()
+        // runs on FreeSWITCH's own thread (normal hangup/stop). Without the
+        // lock both can observe close_requested==0, both call finish() on the
+        // same AudioStreamer, and the resulting concurrent WebSocketClient
+        // disconnect() calls double-join() libwsc's event thread, throwing an
+        // uncaught std::system_error that aborts the whole process.
         if (tech_pvt->mutex) {
             switch_mutex_lock(tech_pvt->mutex);
         }
-        
+        if (tech_pvt->close_requested) {
+            if (tech_pvt->mutex) {
+                switch_mutex_unlock(tech_pvt->mutex);
+            }
+            return;
+        }
+        tech_pvt->close_requested = 1;
+
+        // Clear private data FIRST to prevent "bug already attached" errors
+        switch_channel_set_private(channel, MY_BUG_NAME, nullptr);
+
         auto* audioStreamer = (AudioStreamer *) tech_pvt->pAudioStreamer;
         if (audioStreamer) {
             audioStreamer->deleteFiles();
@@ -1718,22 +1726,28 @@ extern "C" {
         DEBUG_LOG(DEBUG_LEVEL_DEBUG, session, "Cleanup for session %s, channelIsClosing=%d", 
                 sessionId, channelIsClosing);
 
-        // Prevent multiple cleanup calls
+        // Prevent multiple cleanup calls. Locked BEFORE the check (see
+        // media_bug_close() for why): this can run concurrently with a WS
+        // error tearing the session down on libwsc's event thread, and both
+        // paths share this same tech_pvt->close_requested guard.
+        if (tech_pvt->mutex) {
+            switch_mutex_lock(tech_pvt->mutex);
+        }
+
         if (tech_pvt->close_requested) {
             DEBUG_LOG(DEBUG_LEVEL_DEBUG, session, "Cleanup already in progress for session %s", sessionId);
+            if (tech_pvt->mutex) {
+                switch_mutex_unlock(tech_pvt->mutex);
+            }
             // Still need to remove the bug if not closing
             if (!channelIsClosing) {
                 switch_core_media_bug_remove(session, &bug);
             }
             return SWITCH_STATUS_SUCCESS;
         }
-        
+
         tech_pvt->close_requested = 1;
         DEBUG_LOG(DEBUG_LEVEL_DEBUG, session, "Set close_requested flag for session %s", sessionId);
-
-        if (tech_pvt->mutex) {
-            switch_mutex_lock(tech_pvt->mutex);
-        }
 
         // Remove the bug AFTER setting close_requested to avoid race in callback
         if (!channelIsClosing) {
